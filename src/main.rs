@@ -1,8 +1,8 @@
 use eframe::{App, egui};
 use ez_ffmpeg::FfmpegContext;
-use std::time::{Duration, Instant};
-use std::path::PathBuf;
 use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 struct VideoEditorApp {
     frames: Vec<egui::ColorImage>,
@@ -22,20 +22,22 @@ impl VideoEditorApp {
         // ffmpegに実行させる（失敗してもpanicしない）
         let ctx = FfmpegContext::builder()
             .input(video_path)
-            .filter_desc("fps=30,scale=320:-1")
-            .output(format!("{}/frame_%03d.bmp", out_dir))
+            .filter_desc("fps=30,scale=680:-1")
+            .output(format!("{}/frame_%03d.jpeg", out_dir))
             .build()?;
 
         if let Err(e) = ctx.start().and_then(|c| c.wait()) {
             eprintln!("ffmpeg実行エラー: {e}");
         }
 
-        // フレーム画像を読み込む
-        for i in 1..=300 {
-            let path = PathBuf::from(format!("{}/frame_{:03}.bmp", out_dir, i));
+        // フレーム画像を順番に読み込む
+        let mut frame_index = 1;
+        loop {
+            let path = PathBuf::from(format!("{}/frame_{:03}.jpeg", out_dir, frame_index));
             if !path.exists() {
-                break;
+                break; // 存在しなければ終了
             }
+
             match image::open(&path) {
                 Ok(img) => {
                     let rgba = img.to_rgba8();
@@ -44,10 +46,10 @@ impl VideoEditorApp {
                     let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
                     frames.push(color_img);
                 }
-                Err(e) => {
-                    eprintln!("フレーム読み込み失敗 {path:?}: {e}");
-                }
+                Err(e) => eprintln!("フレーム読み込み失敗 {path:?}: {e}"),
             }
+
+            frame_index += 1;
         }
 
         if frames.is_empty() {
@@ -62,9 +64,12 @@ impl VideoEditorApp {
         })
     }
 
-
-
-    fn draw_left_column(&mut self, ui: &mut egui::Ui, view_size: egui::Vec2, timeline_size: egui::Vec2) {
+    fn draw_left_column(
+        &mut self,
+        ui: &mut egui::Ui,
+        view_size: egui::Vec2,
+        timeline_size: egui::Vec2,
+    ) {
         // 左カラムの描画
 
         ui.vertical(|ui| {
@@ -123,8 +128,6 @@ impl VideoEditorApp {
         );
         option_child_ui.label("オプション");
     }
-    
-    
 }
 
 impl App for VideoEditorApp {
@@ -181,14 +184,14 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     // new() が Result を返すように
-    let app = VideoEditorApp::new("/home/aquata/projects/kyopro/videoEditer/assets/sample.mp4")
+    let app = VideoEditorApp::new("/home/aquata/code/videoEditer/assets/sample.mp4")
         .unwrap_or_else(|e| {
             eprintln!("アプリ初期化に失敗しました: {e}");
             VideoEditorApp {
                 frames: Vec::new(),
                 current_frame: 0,
                 last_frame_time: Instant::now(),
-                frame_interval: Duration::from_millis(1000 / 30),
+                frame_interval: Duration::from_millis(1000 / 60),
             }
         });
 
