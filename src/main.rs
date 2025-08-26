@@ -1,5 +1,5 @@
 use eframe::{App, egui};
-use ez_ffmpeg::FfmpegContext;
+use egui::Ui;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -9,10 +9,14 @@ struct VideoEditorApp {
     current_frame: usize,
     last_frame_time: Instant,
     frame_interval: Duration,
+    picked_file: Option<PathBuf>,
+    video_path_input: String,
 }
 
 impl VideoEditorApp {
-    fn new(video_path: &str) -> anyhow::Result<Self> {
+    fn new() -> Self {
+        // 動画読み込み、処理
+        /*
         let mut frames = Vec::new();
 
         //連番ファイルを作成
@@ -22,7 +26,7 @@ impl VideoEditorApp {
         // ffmpegに実行させる（失敗してもpanicしない）
         let ctx = FfmpegContext::builder()
             .input(video_path)
-            .filter_desc("fps=30,scale=680:-1")
+            .filter_desc("fps=30,scale=340:-1")
             .output(format!("{}/frame_%03d.jpeg", out_dir))
             .build()?;
 
@@ -56,12 +60,63 @@ impl VideoEditorApp {
             eprintln!("⚠️ フレームが読み込めませんでした: {video_path}");
         }
 
-        Ok(Self {
-            frames,
+         */
+
+        Self {
+            frames: Vec::new(),
             current_frame: 0,
             last_frame_time: Instant::now(),
             frame_interval: Duration::from_millis(1000 / 30),
-        })
+            picked_file: None,
+            video_path_input: String::new(),
+        }
+    }
+
+    fn load_video(&mut self, path: &PathBuf) {
+        self.picked_file = Some(path.clone());
+
+        let out_dir = "frames";
+        let _ = fs::remove_dir_all(out_dir);
+        let _ = fs::create_dir_all(out_dir);
+
+        // ffmpeg 実行（例: jpeg に変換）
+        let output_pattern = format!("{}/frame_%03d.jpeg", out_dir);
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-i",
+                path.to_str().unwrap(),
+                "-vf",
+                "fps=30,scale=320:-1",
+                &output_pattern,
+            ])
+            .status()
+            .expect("ffmpeg 実行失敗");
+
+        if !status.success() {
+            eprintln!("ffmpeg 実行に失敗しました");
+            return;
+        }
+
+        // フレーム読み込み
+        self.frames.clear();
+        let mut frame_index = 1;
+        loop {
+            let path = PathBuf::from(format!("{}/frame_{:03}.jpeg", out_dir, frame_index));
+            if !path.exists() {
+                break;
+            }
+
+            if let Ok(img) = image::open(&path) {
+                let rgba = img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let pixels = rgba.into_vec();
+                let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                self.frames.push(color_img);
+            }
+            frame_index += 1;
+        }
+
+        println!("{} フレーム読み込み完了", self.frames.len());
     }
 
     fn draw_left_column(
@@ -100,7 +155,7 @@ impl VideoEditorApp {
                 );
                 view_child_ui.image(&tex);
             } else {
-                view_child_ui.label("動画フレームを読み込み中...");
+                view_child_ui.label("動画を選択してください");
             }
             //view_child_ui.label("プレビュー画面");
 
@@ -122,11 +177,26 @@ impl VideoEditorApp {
         ui.painter()
             .rect_filled(rect, 0.0, egui::Color32::from_rgb(200, 200, 240));
 
-        let mut option_child_ui = ui.child_ui(
-            rect,
-            egui::Layout::centered_and_justified(egui::Direction::TopDown),
-        );
-        option_child_ui.label("オプション");
+        let mut option_child_ui = ui.child_ui(rect, egui::Layout::top_down(egui::Align::LEFT));
+
+        //option_child_ui.label("オプション");
+
+        option_child_ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.label("動画パス:");
+                ui.text_edit_singleline(&mut self.video_path_input);
+            });
+
+            if ui.button("読み込み").clicked() {
+                println!("動画パス: {}", self.video_path_input);
+                let path = PathBuf::from(self.video_path_input.clone());
+                if path.exists() {
+                    self.load_video(&path);
+                } else {
+                    eprintln!("指定されたパスが存在しません: {:?}", path);
+                }
+            }
+        });
     }
 }
 
@@ -184,7 +254,8 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     // new() が Result を返すように
-    let app = VideoEditorApp::new("/home/aquata/code/videoEditer/assets/sample.mp4")
+    /*
+    let app = VideoEditorApp::new()
         .unwrap_or_else(|e| {
             eprintln!("アプリ初期化に失敗しました: {e}");
             VideoEditorApp {
@@ -195,5 +266,7 @@ fn main() -> Result<(), eframe::Error> {
             }
         });
 
+    */
+    let app = VideoEditorApp::new();
     eframe::run_native("RustVideoEditor", options, Box::new(|_cc| Box::new(app)))
 }
