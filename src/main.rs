@@ -95,7 +95,7 @@ impl VideoEditorApp {
                 rect,
                 egui::Layout::centered_and_justified(egui::Direction::TopDown),
             );
-            let frames = self.frames.lock().unwrap();
+            let frames = self.frames.lock().unwrap().clone();
             if !frames.is_empty() {
                 if self.last_frame_time.elapsed() >= self.frame_interval {
                     self.current_frame = (self.current_frame + 1) % frames.len();
@@ -125,7 +125,7 @@ impl VideoEditorApp {
                 rect,
                 egui::Layout::centered_and_justified(egui::Direction::TopDown),
             );
-            timeline_child_ui.label("タイムライン");
+            self.draw_timeline(&mut timeline_child_ui, timeline_size);
         });
     }
 
@@ -155,6 +155,39 @@ impl VideoEditorApp {
                 }
             }
         });
+    }
+
+    fn draw_timeline(&mut self, ui: &mut egui::Ui, timeline_size: egui::Vec2) {
+        let frames = self.frames.lock().unwrap();
+        if frames.is_empty() {
+            ui.label("タイムラインはまだありません");
+            return;
+        }
+
+        ui.allocate_ui_with_layout(
+            timeline_size,
+            egui::Layout::left_to_right(egui::Align::TOP),
+            |ui| {
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    let step = 60; // 30フレームごとにサムネイルを作る（1秒ごと）
+                    for (i, frame) in frames.iter().enumerate().step_by(step) {
+                        let tex = ui.ctx().load_texture(
+                            format!("thumb_{}", i),
+                            frame.clone(),
+                            egui::TextureOptions::default(),
+                        );
+
+                        // サムネイルをボタン化
+                        if ui
+                            .add(egui::ImageButton::new((tex.id(), egui::vec2(80.0, 45.0))))
+                            .clicked()
+                        {
+                            self.current_frame = i;
+                        }
+                    }
+                });
+            },
+        );
     }
 }
 
