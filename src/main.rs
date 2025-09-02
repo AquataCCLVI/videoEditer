@@ -1,122 +1,81 @@
 use eframe::{App, egui};
-use egui::Ui;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 struct VideoEditorApp {
-    frames: Vec<egui::ColorImage>,
+    frames: Arc<Mutex<Vec<egui::ColorImage>>>,
     current_frame: usize,
     last_frame_time: Instant,
     frame_interval: Duration,
-    picked_file: Option<PathBuf>,
     video_path_input: String,
+    is_loading: Arc<Mutex<bool>>,
 }
 
 impl VideoEditorApp {
     fn new() -> Self {
-        // 動画読み込み、処理
-        /*
-        let mut frames = Vec::new();
-
-        //連番ファイルを作成
-        let out_dir = "frames";
-        let _ = fs::create_dir_all(out_dir);
-
-        // ffmpegに実行させる（失敗してもpanicしない）
-        let ctx = FfmpegContext::builder()
-            .input(video_path)
-            .filter_desc("fps=30,scale=340:-1")
-            .output(format!("{}/frame_%03d.jpeg", out_dir))
-            .build()?;
-
-        if let Err(e) = ctx.start().and_then(|c| c.wait()) {
-            eprintln!("ffmpeg実行エラー: {e}");
+        Self {
+            frames: Arc::new(Mutex::new(Vec::new())),
+            current_frame: 0,
+            last_frame_time: Instant::now(),
+            frame_interval: Duration::from_millis(1000 / 30),
+            video_path_input: String::new(),
+            is_loading: Arc::new(Mutex::new(false)),
         }
+    }
 
-        // フレーム画像を順番に読み込む
-        let mut frame_index = 1;
-        loop {
-            let path = PathBuf::from(format!("{}/frame_{:03}.jpeg", out_dir, frame_index));
-            if !path.exists() {
-                break; // 存在しなければ終了
+    fn load_video(&mut self, path: PathBuf) {
+        let frames = self.frames.clone();
+        let is_loading = self.is_loading.clone();
+
+        *is_loading.lock().unwrap() = true;
+
+        thread::spawn(move || {
+            let out_dir = "frames";
+            let _ = fs::remove_dir_all(out_dir);
+            let _ = fs::create_dir_all(out_dir);
+
+            let output_pattern = format!("{}/frame_%03d.jpeg", out_dir);
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-i",
+                    path.to_str().unwrap(),
+                    "-vf",
+                    "fps=30,scale=320:-1",
+                    &output_pattern,
+                ])
+                .status()
+                .expect("ffmpeg 実行失敗");
+
+            if !status.success() {
+                eprintln!("ffmpeg 実行に失敗しました");
+                *is_loading.lock().unwrap() = false;
+                return;
             }
 
-            match image::open(&path) {
-                Ok(img) => {
+            let mut frame_index = 1;
+            loop {
+                let path = PathBuf::from(format!("{}/frame_{:03}.jpeg", out_dir, frame_index));
+                if !path.exists() {
+                    break;
+                }
+
+                if let Ok(img) = image::open(&path) {
                     let rgba = img.to_rgba8();
                     let size = [rgba.width() as usize, rgba.height() as usize];
                     let pixels = rgba.into_vec();
                     let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                    frames.push(color_img);
+
+                    frames.lock().unwrap().push(color_img);
                 }
-                Err(e) => eprintln!("フレーム読み込み失敗 {path:?}: {e}"),
+                frame_index += 1;
             }
 
-            frame_index += 1;
-        }
-
-        if frames.is_empty() {
-            eprintln!("⚠️ フレームが読み込めませんでした: {video_path}");
-        }
-
-         */
-
-        Self {
-            frames: Vec::new(),
-            current_frame: 0,
-            last_frame_time: Instant::now(),
-            frame_interval: Duration::from_millis(1000 / 30),
-            picked_file: None,
-            video_path_input: String::new(),
-        }
-    }
-
-    fn load_video(&mut self, path: &PathBuf) {
-        self.picked_file = Some(path.clone());
-
-        let out_dir = "frames";
-        let _ = fs::remove_dir_all(out_dir);
-        let _ = fs::create_dir_all(out_dir);
-
-        // ffmpeg 実行（例: jpeg に変換）
-        let output_pattern = format!("{}/frame_%03d.jpeg", out_dir);
-        let status = std::process::Command::new("ffmpeg")
-            .args([
-                "-i",
-                path.to_str().unwrap(),
-                "-vf",
-                "fps=30,scale=320:-1",
-                &output_pattern,
-            ])
-            .status()
-            .expect("ffmpeg 実行失敗");
-
-        if !status.success() {
-            eprintln!("ffmpeg 実行に失敗しました");
-            return;
-        }
-
-        // フレーム読み込み
-        self.frames.clear();
-        let mut frame_index = 1;
-        loop {
-            let path = PathBuf::from(format!("{}/frame_{:03}.jpeg", out_dir, frame_index));
-            if !path.exists() {
-                break;
-            }
-
-            if let Ok(img) = image::open(&path) {
-                let rgba = img.to_rgba8();
-                let size = [rgba.width() as usize, rgba.height() as usize];
-                let pixels = rgba.into_vec();
-                let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                self.frames.push(color_img);
-            }
-            frame_index += 1;
-        }
-
-        println!("{} フレーム読み込み完了", self.frames.len());
+            println!("{} フレーム読み込み完了", frames.lock().unwrap().len());
+            *is_loading.lock().unwrap() = false;
+        });
     }
 
     fn draw_left_column(
@@ -136,26 +95,25 @@ impl VideoEditorApp {
                 rect,
                 egui::Layout::centered_and_justified(egui::Direction::TopDown),
             );
-            if !self.frames.is_empty() {
-                // 経過時間でフレームを進める
+            let frames = self.frames.lock().unwrap();
+            if !frames.is_empty() {
                 if self.last_frame_time.elapsed() >= self.frame_interval {
-                    self.current_frame = (self.current_frame + 1) % self.frames.len();
+                    self.current_frame = (self.current_frame + 1) % frames.len();
                     self.last_frame_time = Instant::now();
-                }
-
-                //最終フレームまで行ったら最初に戻す
-                if self.current_frame == self.frames.len() - 1 {
-                    self.current_frame = 0;
                 }
 
                 let tex = view_child_ui.ctx().load_texture(
                     "video_frame",
-                    self.frames[self.current_frame].clone(),
+                    frames[self.current_frame].clone(),
                     egui::TextureOptions::default(),
                 );
                 view_child_ui.image(&tex);
             } else {
-                view_child_ui.label("動画を選択してください");
+                if *self.is_loading.lock().unwrap() {
+                    view_child_ui.label("動画読み込み中…");
+                } else {
+                    view_child_ui.label("動画を選択してください");
+                }
             }
             //view_child_ui.label("プレビュー画面");
 
@@ -191,7 +149,7 @@ impl VideoEditorApp {
                 println!("動画パス: {}", self.video_path_input);
                 let path = PathBuf::from(self.video_path_input.clone());
                 if path.exists() {
-                    self.load_video(&path);
+                    self.load_video(path);
                 } else {
                     eprintln!("指定されたパスが存在しません: {:?}", path);
                 }
@@ -253,20 +211,6 @@ fn main() -> Result<(), eframe::Error> {
         ..eframe::NativeOptions::default()
     };
 
-    // new() が Result を返すように
-    /*
-    let app = VideoEditorApp::new()
-        .unwrap_or_else(|e| {
-            eprintln!("アプリ初期化に失敗しました: {e}");
-            VideoEditorApp {
-                frames: Vec::new(),
-                current_frame: 0,
-                last_frame_time: Instant::now(),
-                frame_interval: Duration::from_millis(1000 / 60),
-            }
-        });
-
-    */
     let app = VideoEditorApp::new();
     eframe::run_native("RustVideoEditor", options, Box::new(|_cc| Box::new(app)))
 }
