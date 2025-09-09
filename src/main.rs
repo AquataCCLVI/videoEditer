@@ -1,4 +1,5 @@
 use eframe::{App, egui};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -6,29 +7,39 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 struct VideoEditorApp {
-    frames: Arc<Mutex<Vec<egui::ColorImage>>>,
+    frames: Arc<Mutex<Vec<usize>>>, // frame index のみ保持
+    color_cache: Arc<Mutex<HashMap<usize, egui::ColorImage>>>, // 先読み ColorImage
+    textures: HashMap<usize, egui::TextureHandle>, // GUIスレッド用 Texture
     current_frame: usize,
     last_frame_time: Instant,
     frame_interval: Duration,
     video_path_input: String,
     is_loading: Arc<Mutex<bool>>,
+    total_frames: Arc<Mutex<usize>>,
+    cache_radius: usize,
 }
 
 impl VideoEditorApp {
     fn new() -> Self {
         Self {
             frames: Arc::new(Mutex::new(Vec::new())),
+            color_cache: Arc::new(Mutex::new(HashMap::new())),
+            textures: HashMap::new(),
             current_frame: 0,
             last_frame_time: Instant::now(),
-            frame_interval: Duration::from_millis(1000 / 30),
+            frame_interval: Duration::from_millis(1000 / 60),
             video_path_input: String::new(),
             is_loading: Arc::new(Mutex::new(false)),
+            total_frames: Arc::new(Mutex::new(0)),
+            cache_radius: 10, // 先読みフレーム数増やす
         }
     }
 
     fn load_video(&mut self, path: PathBuf) {
-        let frames = self.frames.clone();
         let is_loading = self.is_loading.clone();
+        let frames = self.frames.clone();
+        let color_cache = self.color_cache.clone();
+        let total_frames_clone = self.total_frames.clone();
 
         *is_loading.lock().unwrap() = true;
 
@@ -43,7 +54,7 @@ impl VideoEditorApp {
                     "-i",
                     path.to_str().unwrap(),
                     "-vf",
-                    "fps=30,scale=320:-1",
+                    "fps=60,scale=640:-1",
                     &output_pattern,
                 ])
                 .status()
@@ -55,27 +66,54 @@ impl VideoEditorApp {
                 return;
             }
 
+            // 出力ファイル数を数えて frames に登録
             let mut frame_index = 1;
+            let mut frame_indices = Vec::new();
             loop {
-                let path = PathBuf::from(format!("{}/frame_{:03}.jpeg", out_dir, frame_index));
-                if !path.exists() {
+                let frame_path = format!("{}/frame_{:03}.jpeg", out_dir, frame_index);
+                if !PathBuf::from(&frame_path).exists() {
                     break;
                 }
-
-                if let Ok(img) = image::open(&path) {
+                // 先読み ColorImage に読み込み
+                if let Ok(img) = image::open(&frame_path) {
                     let rgba = img.to_rgba8();
                     let size = [rgba.width() as usize, rgba.height() as usize];
                     let pixels = rgba.into_vec();
                     let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-
-                    frames.lock().unwrap().push(color_img);
+                    color_cache.lock().unwrap().insert(frame_index, color_img);
                 }
+
+                frame_indices.push(frame_index);
                 frame_index += 1;
             }
 
-            println!("{} フレーム読み込み完了", frames.lock().unwrap().len());
+            *frames.lock().unwrap() = frame_indices;
+            *total_frames_clone.lock().unwrap() = frame_index - 1;
             *is_loading.lock().unwrap() = false;
+            println!("動画の読み込みが完了しました。総フレーム数: {}", frame_index - 1);
         });
+    }
+
+    fn get_texture(&mut self, ui: &egui::Ui, frame_index: usize) -> Option<&egui::TextureHandle> {
+        if !self.textures.contains_key(&frame_index) {
+            let color_cache = self.color_cache.lock().unwrap();
+            if let Some(color_img) = color_cache.get(&frame_index) {
+                let tex = ui.ctx().load_texture(
+                    format!("video_frame_{}", frame_index),
+                    color_img.clone(),
+                    egui::TextureOptions::default(),
+                );
+                self.textures.insert(frame_index, tex);
+            }
+        }
+
+        // 古いキャッシュを削除
+        let min_keep = self.current_frame.saturating_sub(self.cache_radius);
+        let total_frames = *self.total_frames.lock().unwrap();
+        let max_keep = (self.current_frame + self.cache_radius).min(total_frames);
+        self.textures.retain(|&k, _| k >= min_keep && k <= max_keep);
+
+        self.textures.get(&frame_index)
     }
 
     fn draw_left_column(
@@ -84,10 +122,8 @@ impl VideoEditorApp {
         view_size: egui::Vec2,
         timeline_size: egui::Vec2,
     ) {
-        // 左カラムの描画
-
         ui.vertical(|ui| {
-            let (rect, _res) = ui.allocate_exact_size(view_size, egui::Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(view_size, egui::Sense::hover());
             ui.painter()
                 .rect_filled(rect, 0.0, egui::Color32::from_rgb(240, 200, 200));
 
@@ -95,29 +131,22 @@ impl VideoEditorApp {
                 rect,
                 egui::Layout::centered_and_justified(egui::Direction::TopDown),
             );
-            let frames = self.frames.lock().unwrap().clone();
-            if !frames.is_empty() {
-                if self.last_frame_time.elapsed() >= self.frame_interval {
-                    self.current_frame = (self.current_frame + 1) % frames.len();
-                    self.last_frame_time = Instant::now();
-                }
 
-                let tex = view_child_ui.ctx().load_texture(
-                    "video_frame",
-                    frames[self.current_frame].clone(),
-                    egui::TextureOptions::default(),
-                );
-                view_child_ui.image(&tex);
-            } else {
-                if *self.is_loading.lock().unwrap() {
-                    view_child_ui.label("動画読み込み中…");
-                } else {
-                    view_child_ui.label("動画を選択してください");
+            if self.last_frame_time.elapsed() >= self.frame_interval {
+                let total_frames = *self.total_frames.lock().unwrap();
+                if total_frames > 0 {
+                    self.current_frame = (self.current_frame + 1) % total_frames;
                 }
+                self.last_frame_time = Instant::now();
             }
-            //view_child_ui.label("プレビュー画面");
 
-            let (rect, _res) = ui.allocate_exact_size(timeline_size, egui::Sense::hover());
+            if let Some(tex) = self.get_texture(&view_child_ui, self.current_frame) {
+                view_child_ui.image(tex);
+            } else {
+                view_child_ui.label("読み込み中…");
+            }
+
+            let (rect, _) = ui.allocate_exact_size(timeline_size, egui::Sense::hover());
             ui.painter()
                 .rect_filled(rect, 0.0, egui::Color32::from_rgb(200, 240, 200));
 
@@ -130,14 +159,11 @@ impl VideoEditorApp {
     }
 
     fn draw_right_column(&mut self, ui: &mut egui::Ui, option_size: egui::Vec2) {
-        // 右カラムの描画
-        let (rect, _res) = ui.allocate_exact_size(option_size, egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(option_size, egui::Sense::hover());
         ui.painter()
             .rect_filled(rect, 0.0, egui::Color32::from_rgb(200, 200, 240));
 
         let mut option_child_ui = ui.child_ui(rect, egui::Layout::top_down(egui::Align::LEFT));
-
-        //option_child_ui.label("オプション");
 
         option_child_ui.vertical(|ui| {
             ui.horizontal(|ui| {
@@ -146,7 +172,6 @@ impl VideoEditorApp {
             });
 
             if ui.button("読み込み").clicked() {
-                println!("動画パス: {}", self.video_path_input);
                 let path = PathBuf::from(self.video_path_input.clone());
                 if path.exists() {
                     self.load_video(path);
@@ -158,8 +183,8 @@ impl VideoEditorApp {
     }
 
     fn draw_timeline(&mut self, ui: &mut egui::Ui, timeline_size: egui::Vec2) {
-        let frames = self.frames.lock().unwrap();
-        if frames.is_empty() {
+        let frame_indices = self.frames.lock().unwrap();
+        if frame_indices.is_empty() {
             ui.label("タイムラインはまだありません");
             return;
         }
@@ -169,15 +194,24 @@ impl VideoEditorApp {
             egui::Layout::left_to_right(egui::Align::TOP),
             |ui| {
                 egui::ScrollArea::horizontal().show(ui, |ui| {
-                    let step = 60; // 30フレームごとにサムネイルを作る（1秒ごと）
-                    for (i, frame) in frames.iter().enumerate().step_by(step) {
-                        let tex = ui.ctx().load_texture(
-                            format!("thumb_{}", i),
-                            frame.clone(),
-                            egui::TextureOptions::default(),
-                        );
+                    let step = 60; // サムネイル間隔
+                    for &i in frame_indices.iter().step_by(step) {
+                        // 先にサムネイル用 Texture を作っておく
+                        let tex = if let Some(tex) = self.textures.get(&i) {
+                            tex.clone()
+                        } else {
+                            // GUIスレッドで ColorImage から生成
+                            let color_img =
+                                self.color_cache.lock().unwrap().get(&i).unwrap().clone();
+                            let tex = ui.ctx().load_texture(
+                                format!("thumb_{}", i),
+                                color_img,
+                                egui::TextureOptions::default(),
+                            );
+                            self.textures.insert(i, tex.clone());
+                            tex
+                        };
 
-                        // サムネイルをボタン化
                         if ui
                             .add(egui::ImageButton::new((tex.id(), egui::vec2(80.0, 45.0))))
                             .clicked()
@@ -212,24 +246,15 @@ impl App for VideoEditorApp {
 
         ctx.request_repaint();
 
-        //メイン画面構成
         egui::CentralPanel::default().show(ctx, |ui| {
-            //UIを詰める
             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-            //画面サイズを指定→eguiで使える形式に変換
-            let view_size = [860.0, 400.0];
-            let view_size = egui::vec2(view_size[0], view_size[1]);
 
-            let timeline_size = [860.0, 300.0];
-            let timeline_size = egui::vec2(timeline_size[0], timeline_size[1]);
-
-            let option_size = [400.0, 700.0];
-            let option_size = egui::vec2(option_size[0], option_size[1]);
+            let view_size = egui::vec2(860.0, 400.0);
+            let timeline_size = egui::vec2(860.0, 300.0);
+            let option_size = egui::vec2(400.0, 700.0);
 
             ui.horizontal(|ui| {
-                //右左のカラムを関数で分ける
                 self.draw_left_column(ui, view_size, timeline_size);
-
                 self.draw_right_column(ui, option_size);
             });
         });
