@@ -27,7 +27,7 @@ impl VideoEditorApp {
             textures: HashMap::new(),
             current_frame: 0,
             last_frame_time: Instant::now(),
-            frame_interval: Duration::from_millis(1000 / 60),
+            frame_interval: Duration::from_millis(1000 / 30),
             video_path_input: String::new(),
             is_loading: Arc::new(Mutex::new(false)),
             total_frames: Arc::new(Mutex::new(0)),
@@ -54,7 +54,7 @@ impl VideoEditorApp {
                     "-i",
                     path.to_str().unwrap(),
                     "-vf",
-                    "fps=60,scale=640:-1",
+                    "fps=30,scale=320:-1",
                     &output_pattern,
                 ])
                 .status()
@@ -90,7 +90,6 @@ impl VideoEditorApp {
             *frames.lock().unwrap() = frame_indices;
             *total_frames_clone.lock().unwrap() = frame_index - 1;
             *is_loading.lock().unwrap() = false;
-            println!("動画の読み込みが完了しました。総フレーム数: {}", frame_index - 1);
         });
     }
 
