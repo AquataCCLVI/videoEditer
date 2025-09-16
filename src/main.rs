@@ -1,10 +1,25 @@
 use eframe::{App, egui};
+use serde::{Deserialize, Serialize};
+use serde_json;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Deserialize, Serialize)]
+struct FFProbeResult {
+    streams: Vec<Stream>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Stream {
+    width: Option<u32>,
+    height: Option<u32>,
+    r_frame_rate: Option<String>,
+    nb_frames: Option<String>,
+}
 
 struct VideoEditorApp {
     frames: Arc<Mutex<Vec<usize>>>, // frame index のみ保持
@@ -17,6 +32,7 @@ struct VideoEditorApp {
     is_loading: Arc<Mutex<bool>>,
     total_frames: Arc<Mutex<usize>>,
     cache_radius: usize,
+    infomation: Arc<Mutex<Option<FFProbeResult>>>,
 }
 
 impl VideoEditorApp {
@@ -32,6 +48,7 @@ impl VideoEditorApp {
             is_loading: Arc::new(Mutex::new(false)),
             total_frames: Arc::new(Mutex::new(0)),
             cache_radius: 10, // 先読みフレーム数増やす
+            infomation: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -40,13 +57,17 @@ impl VideoEditorApp {
         let frames = self.frames.clone();
         let color_cache = self.color_cache.clone();
         let total_frames_clone = self.total_frames.clone();
+        let infomation_clone = self.infomation.clone();
 
         *is_loading.lock().unwrap() = true;
 
         thread::spawn(move || {
             let out_dir = "frames";
+            let info_dir = "video_info";
             let _ = fs::remove_dir_all(out_dir);
+            let _ = fs::remove_dir_all(info_dir);
             let _ = fs::create_dir_all(out_dir);
+            let _ = fs::create_dir_all(info_dir);
 
             let output_pattern = format!("{}/frame_%03d.jpeg", out_dir);
             let status = std::process::Command::new("ffmpeg")
@@ -54,7 +75,7 @@ impl VideoEditorApp {
                     "-i",
                     path.to_str().unwrap(),
                     "-vf",
-                    "fps=30,scale=320:-1",
+                    "fps=30,scale=640:-1",
                     &output_pattern,
                 ])
                 .status()
@@ -64,6 +85,21 @@ impl VideoEditorApp {
                 eprintln!("ffmpeg 実行に失敗しました");
                 *is_loading.lock().unwrap() = false;
                 return;
+            }
+
+            // ffprobe で動画情報を取得
+            // スレッド内なのでselfは使えない
+            if let Some(video_info) = Self::probe_video(&path) {
+                // JSONファイルとして保存
+                let info_path = format!("{}/info.json", info_dir);
+                if let Ok(json_str) = serde_json::to_string_pretty(&video_info) {
+                    let _ = fs::write(&info_path, json_str);
+                }
+                let mut info_lock = infomation_clone.lock().unwrap();
+                *info_lock = Some(video_info);
+                println!("動画情報を表示します: {:?}", *info_lock);
+            } else {
+                eprintln!("動画情報の取得に失敗しました");
             }
 
             // 出力ファイル数を数えて frames に登録
@@ -91,6 +127,29 @@ impl VideoEditorApp {
             *total_frames_clone.lock().unwrap() = frame_index - 1;
             *is_loading.lock().unwrap() = false;
         });
+    }
+
+    fn probe_video(path: &PathBuf) -> Option<FFProbeResult> {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                path.to_str().unwrap(),
+            ])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            eprintln!("ffprobe 実行に失敗");
+            return None;
+        }
+
+        let json_str = String::from_utf8_lossy(&output.stdout);
+        serde_json::from_str(&json_str).ok()
     }
 
     fn get_texture(&mut self, ui: &egui::Ui, frame_index: usize) -> Option<&egui::TextureHandle> {
@@ -178,7 +237,46 @@ impl VideoEditorApp {
                     eprintln!("指定されたパスが存在しません: {:?}", path);
                 }
             }
+
+            ui.label("動画情報:");
+            if let Some(info) = &*self.infomation.lock().unwrap() {
+                // info.streamsの一周目は動画情報、2周目は音声情報
+
+                for (i, stream) in info.streams.iter().enumerate() {
+                    if i == 0 {
+                        ui.label("【動画ストリーム】");
+                    } else if i == 1 {
+                        ui.label("【音声ストリーム】");
+                    } else {
+                        ui.label(&format!("【その他のストリーム {}】", i));
+                    }
+                    if let (Some(width), Some(height)) = (stream.width, stream.height) {
+                        ui.label(format!("解像度: {}x{}", width, height));
+                    }
+                    if let Some(rate) = &stream.r_frame_rate {
+                        ui.label(format!("フレームレート: {}", self.parse_fps(rate).unwrap_or(0.0)) );
+                    }
+                    if let Some(nb) = &stream.nb_frames {
+                        ui.label(format!("総フレーム数: {}", nb));
+                    }
+                }
+            } else {
+                ui.label("動画情報はありません");
+            }
         });
+    }
+
+    // 分数の文字列をパースする関数
+    fn parse_fps(&self, s: &str) -> Option<f64> {
+        let parts: Vec<&str> = s.split('/').collect();
+        if parts.len() == 2 {
+            if let (Ok(num), Ok(den)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
+                if den != 0.0 {
+                    return Some(num / den);
+                }
+            }
+        }
+        None
     }
 
     fn draw_timeline(&mut self, ui: &mut egui::Ui, timeline_size: egui::Vec2) {
