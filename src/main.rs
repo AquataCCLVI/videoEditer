@@ -33,6 +33,8 @@ struct VideoEditorApp {
     total_frames: Arc<Mutex<usize>>,
     cache_radius: usize,
     infomation: Arc<Mutex<Option<FFProbeResult>>>,
+    start_frame: String,
+    end_frame: String,
 }
 
 impl VideoEditorApp {
@@ -49,6 +51,8 @@ impl VideoEditorApp {
             total_frames: Arc::new(Mutex::new(0)),
             cache_radius: 10, // 先読みフレーム数増やす
             infomation: Arc::new(Mutex::new(None)),
+            start_frame: String::new(),
+            end_frame: String::new(),
         }
     }
 
@@ -150,6 +154,129 @@ impl VideoEditorApp {
 
         let json_str = String::from_utf8_lossy(&output.stdout);
         serde_json::from_str(&json_str).ok()
+    }
+
+    // ffmpegで動画をトリミングする
+    fn trim_video(&self, input_path: PathBuf, start: usize, end: usize) -> Result<(), String> {
+        let frames = self.frames.clone();
+        let color_cache = self.color_cache.clone();
+        let total_frames = self.total_frames.clone();
+        let is_loading = self.is_loading.clone();
+        let infomation_clone = self.infomation.clone();
+        let info_dir = "video_info";
+
+        *is_loading.lock().unwrap() = true;
+
+        thread::spawn(move || {
+            if start >= end {
+                eprintln!("開始フレームは終了フレームより小さくなければなりません");
+                *is_loading.lock().unwrap() = false;
+                return;
+            }
+
+            let out_dir = "frames";
+            let _ = std::fs::remove_dir_all(out_dir);
+            let _ = std::fs::create_dir_all(out_dir);
+
+            let output_pattern = format!("{}/frame_%03d.jpeg", out_dir);
+
+            // ffprobe で動画情報を取得
+            // スレッド内なのでselfは使えない
+            if let Some(video_info) = Self::probe_video(&input_path) {
+                // JSONファイルとして保存
+                let info_path = format!("{}/info.json", info_dir);
+                if let Ok(json_str) = serde_json::to_string_pretty(&video_info) {
+                    let _ = fs::write(&info_path, json_str);
+                }
+                let mut info_lock = infomation_clone.lock().unwrap();
+                *info_lock = Some(video_info);
+                println!("動画情報を表示します: {:?}", *info_lock);
+            } else {
+                eprintln!("動画情報の取得に失敗しました");
+            }
+
+            // ffmpegでフレーム抽出
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-i",
+                    input_path.to_str().unwrap(),
+                    "-vf",
+                    &format!("select=between(n\\,{start}\\,{end}),scale=640:-1"),
+                    "-vsync",
+                    "0",
+                    &output_pattern,
+                ])
+                .status()
+                .expect("ffmpeg 実行失敗");
+
+            if !status.success() {
+                eprintln!("ffmpeg 実行に失敗しました");
+                *is_loading.lock().unwrap() = false;
+                return;
+            }
+
+            // フレームを読み込んでキャッシュに登録
+            let mut frame_indices = Vec::new();
+            let mut frame_index = 1;
+            loop {
+                let frame_path = format!("{}/frame_{:03}.jpeg", out_dir, frame_index);
+                if !PathBuf::from(&frame_path).exists() {
+                    break;
+                }
+
+                if let Ok(img) = image::open(&frame_path) {
+                    let rgba = img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let pixels = rgba.into_vec();
+                    let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                    color_cache.lock().unwrap().insert(frame_index, color_img);
+                }
+
+                frame_indices.push(frame_index);
+                frame_index += 1;
+            }
+
+            *frames.lock().unwrap() = frame_indices;
+            *total_frames.lock().unwrap() = frame_index - 1;
+
+            *is_loading.lock().unwrap() = false;
+            println!("トリミング完了: {start} ~ {end} フレームを読み込みました");
+        });
+
+        Ok(())
+    }
+
+    fn export_mp4(&self, output_path: PathBuf, fps: usize) -> Result<(), String> {
+        let out_dir = "frames";
+        if !PathBuf::from(out_dir).exists() {
+            return Err("フレームディレクトリが存在しません".to_string());
+        }
+
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-framerate",
+                &fps.to_string(),
+                "-i",
+                &format!("{}/frame_%03d.jpeg", out_dir),
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                output_path.to_str().unwrap(),
+            ])
+            .status()
+            .map_err(|e| format!("ffmpeg 実行失敗: {}", e))?;
+
+        if !status.success() {
+            return Err("ffmpeg 実行に失敗しました".to_string());
+        }
+
+        Ok(())
+
+
     }
 
     fn get_texture(&mut self, ui: &egui::Ui, frame_index: usize) -> Option<&egui::TextureHandle> {
@@ -254,7 +381,10 @@ impl VideoEditorApp {
                         ui.label(format!("解像度: {}x{}", width, height));
                     }
                     if let Some(rate) = &stream.r_frame_rate {
-                        ui.label(format!("フレームレート: {}", self.parse_fps(rate).unwrap_or(0.0)) );
+                        ui.label(format!(
+                            "フレームレート: {}",
+                            self.parse_fps(rate).unwrap_or(0.0)
+                        ));
                     }
                     if let Some(nb) = &stream.nb_frames {
                         ui.label(format!("総フレーム数: {}", nb));
@@ -263,6 +393,44 @@ impl VideoEditorApp {
             } else {
                 ui.label("動画情報はありません");
             }
+
+            ui.horizontal(|ui| {
+                ui.label("動画始点:");
+                ui.text_edit_singleline(&mut self.start_frame);
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("動画終点:");
+                ui.text_edit_singleline(&mut self.end_frame);
+            });
+
+            if ui.button("動画をトリミングする").clicked() {
+                let path = PathBuf::from(self.video_path_input.clone());
+                if path.exists() {
+                    let start = self.start_frame.clone().parse().unwrap_or(0);
+                    let end = self.end_frame.clone().parse().unwrap_or(0);
+                    match self.trim_video(path, start, end) {
+                        Ok(out_path) => println!("トリミング完了: {:?}", out_path),
+                        Err(e) => eprintln!("{e}"),
+                    }
+                } else {
+                    eprintln!("指定されたパスが存在しません: {:?}", path);
+                }
+            }
+
+            ui.horizontal(|ui| {
+                ui.label("動画を出力させる:");
+                if ui.button("出力").clicked() {
+                    // export_mp4関数を呼び出す
+                    let output_path = PathBuf::from("output.mp4");
+                    let fps = 30; // 固定値
+                    if let Err(e) = self.export_mp4(output_path, fps) {
+                        eprintln!("動画の出力に失敗しました: {}", e);
+                    } else {
+                        println!("動画を出力しました: output.mp4");
+                    }
+                }
+            });
         });
     }
 
