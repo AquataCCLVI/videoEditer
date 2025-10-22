@@ -1,11 +1,11 @@
 use eframe::{App, egui};
-use std::{collections::HashMap, time};
 
-struct MyApp {
-    textures: HashMap<String, egui::TextureHandle>,
+
+struct VideoEditorApp {
+
 }
 
-impl App for MyApp {
+impl App for VideoEditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 日本語フォント設定
         use egui::FontData;
@@ -99,9 +99,7 @@ fn main() -> Result<(), eframe::Error> {
         "My GUI App",
         options,
         Box::new(|_cc| {
-            Box::new(MyApp {
-                textures: HashMap::new(),
-            }) as Box<dyn App>
+            Box::new(VideoEditorApp {}) as Box<dyn App>
         }),
     )
 }
