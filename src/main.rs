@@ -1,11 +1,11 @@
 
-use anyhow::Result;
 use eframe::{App, egui};
 use ffmpeg_next as ffmpeg;
 use image::RgbImage;
 use std::default::Default;
 use std::fs;
 use std::process::Command;
+use std::io::Write;
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -80,12 +80,12 @@ impl VideoClip {
 
 struct VideoEditorApp {
     video_path_input: String,
-    texture: Option<egui::TextureHandle>,
+    texture: Option<egui::TextureHandle>, // 動画表示用テクスチャ
     playing: bool,
-    last_update: Instant,
+    last_update: Instant, // 最後にフレームを更新した時間
     size: (u32, u32),
     fps: f32,
-    frames: Vec<Vec<u8>>,
+    frames: Vec<Vec<u8>>, // 動画フレーム
     current_frame: usize,
     current_clip: Option<VideoClip>,
     // 切り取り用の秒数指定
@@ -96,6 +96,9 @@ struct VideoEditorApp {
     // エクスポートステータスと受信チャネル
     export_status: Option<String>,
     export_rx: Option<Receiver<String>>,
+    // 音声関連設定
+    include_audio: bool, // エクスポート時に元動画の音声トラックを含める
+    audio_offset_frames: usize,   // frames[0] が元動画の何フレーム目に相当するか（音声同期用オフセット）
 }
 
 impl Default for VideoEditorApp {
@@ -116,6 +119,8 @@ impl Default for VideoEditorApp {
             output_path: "output.mp4".to_string(),
             export_status: None,
             export_rx: None,
+            include_audio: true,
+            audio_offset_frames: 0,
         }
     }
 }
@@ -174,18 +179,7 @@ impl VideoEditorApp {
             timeline_child_ui.label("タイムライン");
         });
 
-        // 受信チャネルがある場合はメッセージをチェックしてステータス表示を更新
-        if let Some(rx) = &self.export_rx {
-            if let Ok(msg) = rx.try_recv() {
-                self.export_status = Some(msg);
-                // 成功・致命的メッセージならチャネルをクリア
-                if let Some(s) = &self.export_status {
-                    if s.starts_with("Export succeeded") || s.starts_with("No frames to export") {
-                        self.export_rx = None;
-                    }
-                }
-            }
-        }
+        // export_rx のポーリングは update() 側で行う（再描画要求を出せるように）
     }
 
     fn draw_right_column(&mut self, ui: &mut egui::Ui, option_size: egui::Vec2) {
@@ -220,6 +214,8 @@ impl VideoEditorApp {
                             fps: clip.fps,
                             frames: Vec::new(),
                         });
+                        // reset audio offset when loading a new clip
+                        self.audio_offset_frames = 0;
                         self.playing = false;
                         self.last_update = Instant::now();
                     }
@@ -277,6 +273,12 @@ impl VideoEditorApp {
                         if s < e {
                             // drain the range [s, e)
                             self.frames.drain(s..e);
+                            // if we removed from the head, advance audio offset accordingly
+                            if s == 0 {
+                                self.audio_offset_frames = self
+                                    .audio_offset_frames
+                                    .saturating_add(e - s);
+                            }
                             // adjust current_frame to be at start s (or end)
                             self.current_frame = s.min(self.frames.len());
                         }
@@ -298,6 +300,10 @@ impl VideoEditorApp {
 
                         if s < e {
                             let new_frames: Vec<Vec<u8>> = self.frames[s..e].to_vec();
+                            // update audio offset because we discard frames before s
+                            self.audio_offset_frames = self
+                                .audio_offset_frames
+                                .saturating_add(s);
                             self.frames = new_frames;
                             self.current_frame = 0;
                         }
@@ -311,6 +317,10 @@ impl VideoEditorApp {
                 ui.text_edit_singleline(&mut self.output_path);
             });
 
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.include_audio, "元動画の音声を含める");
+            });
+
             if ui.button("書き出し").clicked() {
                 // set up channel and spawn thread so we can receive status messages
                 let (tx, rx) = channel::<String>();
@@ -319,8 +329,14 @@ impl VideoEditorApp {
 
                 let out = self.output_path.clone();
                 let frames = self.frames.clone();
+                let include_audio = self.include_audio;
+                let audio_source = self
+                    .current_clip
+                    .as_ref()
+                    .map(|c| c.video_path_input.clone());
                 let (w, h) = self.size;
                 let fps = self.fps;
+                let audio_offset_frames = self.audio_offset_frames;
 
                 thread::spawn(move || {
                     if frames.is_empty() {
@@ -328,76 +344,117 @@ impl VideoEditorApp {
                         return;
                     }
 
-                    let _ = tx.send("Creating temp dir".to_string());
-                    // create temporary dir
-                    let now_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis();
-                    let tmpdir = std::env::temp_dir().join(format!("video_export_{}", now_ms));
-                    if let Err(e) = fs::create_dir_all(&tmpdir) {
-                        let _ = tx.send(format!("failed to create tmpdir: {}", e));
-                        return;
-                    }
+                        // Stream frames directly to ffmpeg stdin (rawvideo) to avoid PNG save overhead
+                        let _ = tx.send("Starting ffmpeg (stdin rawvideo)".to_string());
 
-                    // save frames as PNG
-                    let total = frames.len();
-                    for (i, fr) in frames.iter().enumerate() {
-                        if i % 30 == 0 {
-                            let _ = tx.send(format!("Saving frames: {}/{}", i, total));
+                        // decide absolute output path
+                        let out_path_abs = if std::path::Path::new(&out).is_absolute() {
+                            std::path::PathBuf::from(&out)
+                        } else {
+                            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")).join(&out)
+                        };
+
+                        // build ffmpeg args for rawvideo on stdin
+                        let mut args: Vec<String> = Vec::new();
+                        args.push("-y".to_string());
+                        args.push("-f".to_string());
+                        args.push("rawvideo".to_string());
+                        args.push("-pix_fmt".to_string());
+                        args.push("rgb24".to_string());
+                        args.push("-s".to_string());
+                        args.push(format!("{}x{}", w, h));
+                        args.push("-r".to_string());
+                        args.push(format!("{}", fps));
+                        args.push("-i".to_string());
+                        args.push("pipe:0".to_string());
+
+                        // if including audio and we have a source path, add it as a second input
+                        if include_audio {
+                            if let Some(audio_path) = audio_source {
+                                // calculate audio start time from audio_offset_frames
+                                // audio_offset_frames is number of frames removed from original head
+                                let audio_start_sec = (audio_offset_frames as f64) / (fps as f64);
+                                if audio_start_sec > 0.0 {
+                                    args.push("-ss".to_string());
+                                    args.push(format!("{:.3}", audio_start_sec));
+                                }
+
+                                // limit audio input length to video duration so audio won't overshoot
+                                let duration_sec = if fps > 0.0 {
+                                    (frames.len() as f64) / (fps as f64)
+                                } else {
+                                    0.0
+                                };
+                                if duration_sec > 0.0 {
+                                    args.push("-t".to_string());
+                                    args.push(format!("{:.3}", duration_sec));
+                                }
+
+                                args.push("-i".to_string());
+                                args.push(audio_path.clone());
+                                // map video from first input and audio from second input
+                                args.push("-map".to_string());
+                                args.push("0:v:0".to_string());
+                                args.push("-map".to_string());
+                                args.push("1:a:0".to_string());
+                            }
                         }
-                        let img = match RgbImage::from_raw(w, h, fr.clone()) {
-                            Some(i) => i,
-                            None => {
-                                let _ = tx.send(format!("failed to create image for frame {}", i));
-                                continue;
+
+                        args.push("-c:v".to_string());
+                        args.push("libx264".to_string());
+                        args.push("-pix_fmt".to_string());
+                        args.push("yuv420p".to_string());
+
+                        if include_audio {
+                            args.push("-c:a".to_string());
+                            args.push("aac".to_string());
+                            args.push("-b:a".to_string());
+                            args.push("192k".to_string());
+                            args.push("-shortest".to_string());
+                        }
+
+                        args.push(out_path_abs.to_string_lossy().to_string());
+
+                        let mut child = match Command::new("ffmpeg").args(&args).stdin(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = tx.send(format!("failed to spawn ffmpeg: {}", e));
+                                return;
                             }
                         };
-                        let fname = tmpdir.join(format!("frame_{:06}.png", i + 1));
-                        if let Err(e) = img.save(&fname) {
-                            let _ = tx.send(format!("failed to save frame {}: {}", i, e));
-                        }
-                    }
 
-                    let _ = tx.send("Running ffmpeg".to_string());
-                    // decide absolute output path so ffmpeg writes outside tmpdir
-                    let out_path_abs = if std::path::Path::new(&out).is_absolute() {
-                        std::path::PathBuf::from(&out)
-                    } else {
-                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")).join(&out)
-                    };
-
-                    // run ffmpeg to assemble and capture output
-                    let ffmpeg_out = Command::new("ffmpeg")
-                        .arg("-y")
-                        .arg("-framerate")
-                        .arg(format!("{}", fps))
-                        .arg("-i")
-                        .arg("frame_%06d.png")
-                        .arg("-c:v")
-                        .arg("libx264")
-                        .arg("-pix_fmt")
-                        .arg("yuv420p")
-                        .arg(out_path_abs.to_string_lossy().as_ref())
-                        .current_dir(&tmpdir)
-                        .output();
-
-                    match ffmpeg_out {
-                        Ok(output) => {
-                            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                            if output.status.success() {
-                                let _ = tx.send(format!("Export succeeded: {}", out_path_abs.display()));
-                                // cleanup temp dir
-                                let _ = fs::remove_dir_all(&tmpdir);
-                            } else {
-                                let _ = tx.send(format!("ffmpeg failed: status={} stderr={} ", output.status, stderr));
-                                // keep tmpdir for debugging
+                        // write frames to ffmpeg stdin
+                        if let Some(mut stdin) = child.stdin.take() {
+                            let total = frames.len();
+                            for (i, fr) in frames.iter().enumerate() {
+                                
+                                let _ = tx.send(format!("Writing frames: {}/{}", i, total));
+                                
+                                if let Err(e) = stdin.write_all(fr) {
+                                    let _ = tx.send(format!("failed to write frame {}: {}", i, e));
+                                    break;
+                                }
                             }
+                            // close stdin to signal EOF
+                            drop(stdin);
+
+                            // wait for ffmpeg to finish and capture stderr
+                            match child.wait_with_output() {
+                                Ok(output) => {
+                                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                                    if output.status.success() {
+                                        let _ = tx.send(format!("Export succeeded: {}", out_path_abs.display()));
+                                    } else {
+                                        let _ = tx.send(format!("ffmpeg failed: status={} stderr={}", output.status, stderr));
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(format!("failed waiting for ffmpeg: {}", e));
+                                }
+                            }
+                        } else {
+                            let _ = tx.send("failed to open ffmpeg stdin".to_string());
                         }
-                        Err(e) => {
-                            let _ = tx.send(format!("failed to run ffmpeg: {}", e));
-                        }
-                    }
                 });
             }
             if let Some(status) = &self.export_status {
@@ -428,6 +485,36 @@ impl App for VideoEditorApp {
             .unwrap()
             .insert(0, "keifont".to_owned());
         ctx.set_fonts(fonts);
+
+        // export スレッドからのメッセージをここで受け取り、受信があれば再描画要求を出す
+        if let Some(rx) = &self.export_rx {
+            let mut any = false;
+            // drain available messages
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        self.export_status = Some(msg.clone());
+                        any = true;
+                        if let Some(s) = &self.export_status {
+                            if s.starts_with("Export succeeded") || s.starts_with("No frames to export") {
+                                // 完了メッセージが来たらチャネルを外す
+                                self.export_rx = None;
+                                break;
+                            }
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // 切断されたらチャネル解放
+                        self.export_rx = None;
+                        break;
+                    }
+                }
+            }
+            if any {
+                ctx.request_repaint();
+            }
+        }
 
 
         if self.playing && !self.frames.is_empty() {
@@ -515,6 +602,11 @@ impl App for VideoEditorApp {
                 self.draw_right_column(ui, option_size);
             });
         });
+
+        // 再生中はイベントが来ない環境でも定期的に update() を呼ぶよう要求する
+        if self.playing {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
     }
 }
 
