@@ -88,6 +88,10 @@ struct VideoEditorApp {
     frames: Vec<Vec<u8>>, // 動画フレーム
     current_frame: usize,
     current_clip: Option<VideoClip>,
+    // タイムライン用サムネイルキャッシュ (frame_index, texture)
+    timeline_thumbs: Vec<(usize, egui::TextureHandle)>,
+    // サムネイル再生成フラグ
+    timeline_dirty: bool,
     // 切り取り用の秒数指定
     cut_start_sec: f32,
     cut_end_sec: f32,
@@ -114,6 +118,8 @@ impl Default for VideoEditorApp {
             frames: Vec::new(),
             current_frame: 0,
             current_clip: None,
+            timeline_thumbs: Vec::new(),
+            timeline_dirty: false,
             cut_start_sec: 0.0,
             cut_end_sec: 0.0,
             output_path: "output.mp4".to_string(),
@@ -176,7 +182,58 @@ impl VideoEditorApp {
                 rect,
                 egui::Layout::centered_and_justified(egui::Direction::TopDown),
             );
-            timeline_child_ui.label("タイムライン");
+            //timeline_child_ui.label("タイムライン");
+
+            // タイムラインに数秒ごとのサムネイルを並べる
+            let ctx = ui.ctx();
+            // 間隔（秒） -- 必要ならUIで変更可能にする
+            let interval_sec = 1.0_f32;
+            if !self.frames.is_empty() {
+                // 再生成が必要なら作る
+                if self.timeline_dirty {
+                    // 既存テクスチャを drop して再生成
+                    self.timeline_thumbs.clear();
+                    let total = self.frames.len();
+                    let step = ((self.fps * interval_sec).round() as usize).max(1);
+                    // サムネイルサイズ（小さめ）
+                    let thumb_w = 160u32;
+                    let thumb_h = 90u32;
+                    for idx in (0..total).step_by(step) {
+                        let frame = &self.frames[idx];
+                        // 簡易ダウンサンプリング nearest
+                        let src_w = self.size.0;
+                        let src_h = self.size.1;
+                        let mut out = vec![0u8; (thumb_w as usize) * (thumb_h as usize) * 3];
+                        for y in 0..thumb_h {
+                            for x in 0..thumb_w {
+                                let src_x = ((x as f32) * (src_w as f32 / thumb_w as f32)) as u32;
+                                let src_y = ((y as f32) * (src_h as f32 / thumb_h as f32)) as u32;
+                                let src_idx = ((src_y * src_w + src_x) as usize) * 3;
+                                let dst_idx = ((y * thumb_w + x) as usize) * 3;
+                                out[dst_idx..dst_idx + 3].copy_from_slice(&frame[src_idx..src_idx + 3]);
+                            }
+                        }
+                        let color_image = egui::ColorImage::from_rgb([thumb_w as usize, thumb_h as usize], &out);
+                        let tex = ctx.load_texture(&format!("thumb_{}", idx), color_image, egui::TextureOptions::LINEAR);
+                        self.timeline_thumbs.push((idx, tex));
+                    }
+                    self.timeline_dirty = false;
+                }
+
+                // 描画: 横スクロール可能にする
+                let mut scroll = egui::containers::ScrollArea::horizontal();
+                scroll.show(&mut timeline_child_ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (idx, tex) in &self.timeline_thumbs {
+                            let size = egui::vec2(160.0, 90.0);
+                            // 画像をボタンにしてクリックでそのフレームへ移動
+                            if ui.add(egui::ImageButton::new((tex.id(), size))).clicked() {
+                                self.current_frame = *idx;
+                            }
+                        }
+                    });
+                });
+            }
         });
 
         // export_rx のポーリングは update() 側で行う（再描画要求を出せるように）
@@ -206,6 +263,8 @@ impl VideoEditorApp {
                         self.fps = clip.fps;
                         // move frames out of clip into self.frames (Vecにムーブ)
                         self.frames = clip.frames;
+                        // mark timeline thumbs dirty so they regenerate
+                        self.timeline_dirty = true;
                         self.current_frame = 0;
                         // current_clip にはメタデータのみ保持（フレームは self.frames にムーブ済み）
                         self.current_clip = Some(VideoClip {
@@ -214,7 +273,7 @@ impl VideoEditorApp {
                             fps: clip.fps,
                             frames: Vec::new(),
                         });
-                        // reset audio offset when loading a new clip
+                        // リセット
                         self.audio_offset_frames = 0;
                         self.playing = false;
                         self.last_update = Instant::now();
@@ -262,8 +321,10 @@ impl VideoEditorApp {
                         let total_frames = self.frames.len();
                         let mut start_f = (self.cut_start_sec * self.fps).round() as isize;
                         let mut end_f = (self.cut_end_sec * self.fps).round() as isize;
+                        // 負の数は0に補正
                         if start_f < 0 { start_f = 0; }
-                        if end_f < 0 { end_f = 0; }
+                        // 負の数、または0は最後までに補正
+                        if end_f <= 0 { end_f = total_frames as isize; }
                         let mut s = start_f as usize;
                         let mut e = end_f as usize;
                         if s > total_frames { s = total_frames; }
@@ -271,16 +332,18 @@ impl VideoEditorApp {
                         if s > e { std::mem::swap(&mut s, &mut e); }
 
                         if s < e {
-                            // drain the range [s, e)
+                            // 指定範囲を削除
                             self.frames.drain(s..e);
-                            // if we removed from the head, advance audio offset accordingly
+                            // 先頭から削った場合は audio_offset_frames を調整
                             if s == 0 {
                                 self.audio_offset_frames = self
                                     .audio_offset_frames
                                     .saturating_add(e - s);
                             }
-                            // adjust current_frame to be at start s (or end)
+                            // current_frame が範囲内にある場合は s に移動
                             self.current_frame = s.min(self.frames.len());
+                            // サムネイル再生成フラグ
+                            self.timeline_dirty = true;
                         }
                     }
                 }
@@ -300,12 +363,14 @@ impl VideoEditorApp {
 
                         if s < e {
                             let new_frames: Vec<Vec<u8>> = self.frames[s..e].to_vec();
-                            // update audio offset because we discard frames before s
+                            // 先頭から抽出した場合は audio_offset_frames を調整
                             self.audio_offset_frames = self
                                 .audio_offset_frames
                                 .saturating_add(s);
                             self.frames = new_frames;
                             self.current_frame = 0;
+                            // サムネイル再生成フラグ
+                            self.timeline_dirty = true;
                         }
                     }
                 }
@@ -324,7 +389,7 @@ impl VideoEditorApp {
             if ui.button("書き出し").clicked() {
                 // set up channel and spawn thread so we can receive status messages
                 let (tx, rx) = channel::<String>();
-                self.export_status = Some("Export started".to_string());
+                self.export_status = Some("エクスポート開始".to_string());
                 self.export_rx = Some(rx);
 
                 let out = self.output_path.clone();
@@ -340,14 +405,14 @@ impl VideoEditorApp {
 
                 thread::spawn(move || {
                     if frames.is_empty() {
-                        let _ = tx.send("No frames to export".to_string());
+                        let _ = tx.send("フレームがありません！".to_string());
                         return;
                     }
 
                         // Stream frames directly to ffmpeg stdin (rawvideo) to avoid PNG save overhead
                         let _ = tx.send("Starting ffmpeg (stdin rawvideo)".to_string());
 
-                        // decide absolute output path
+                        // output path absolute
                         let out_path_abs = if std::path::Path::new(&out).is_absolute() {
                             std::path::PathBuf::from(&out)
                         } else {
@@ -368,18 +433,18 @@ impl VideoEditorApp {
                         args.push("-i".to_string());
                         args.push("pipe:0".to_string());
 
-                        // if including audio and we have a source path, add it as a second input
+                        // audio input
                         if include_audio {
                             if let Some(audio_path) = audio_source {
-                                // calculate audio start time from audio_offset_frames
-                                // audio_offset_frames is number of frames removed from original head
+                                // 元動画から音声トラックを取得
+                                // オフセット分を考慮して開始位置を調整
                                 let audio_start_sec = (audio_offset_frames as f64) / (fps as f64);
                                 if audio_start_sec > 0.0 {
                                     args.push("-ss".to_string());
                                     args.push(format!("{:.3}", audio_start_sec));
                                 }
 
-                                // limit audio input length to video duration so audio won't overshoot
+                                // 動画の長さに合わせて音声も切り取る
                                 let duration_sec = if fps > 0.0 {
                                     (frames.len() as f64) / (fps as f64)
                                 } else {
@@ -392,7 +457,7 @@ impl VideoEditorApp {
 
                                 args.push("-i".to_string());
                                 args.push(audio_path.clone());
-                                // map video from first input and audio from second input
+                                // マッピング
                                 args.push("-map".to_string());
                                 args.push("0:v:0".to_string());
                                 args.push("-map".to_string());
@@ -418,20 +483,20 @@ impl VideoEditorApp {
                         let mut child = match Command::new("ffmpeg").args(&args).stdin(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
                             Ok(c) => c,
                             Err(e) => {
-                                let _ = tx.send(format!("failed to spawn ffmpeg: {}", e));
+                                let _ = tx.send(format!("ffmepg起動失敗: {}", e));
                                 return;
                             }
                         };
 
-                        // write frames to ffmpeg stdin
+                        // ffmpeg の stdin にフレームを書き込む
                         if let Some(mut stdin) = child.stdin.take() {
                             let total = frames.len();
                             for (i, fr) in frames.iter().enumerate() {
                                 
-                                let _ = tx.send(format!("Writing frames: {}/{}", i, total));
+                                let _ = tx.send(format!("フレームを書き込み中: {}/{}", i, total));
                                 
                                 if let Err(e) = stdin.write_all(fr) {
-                                    let _ = tx.send(format!("failed to write frame {}: {}", i, e));
+                                    let _ = tx.send(format!("書き込みに失敗しました {}: {}", i, e));
                                     break;
                                 }
                             }
@@ -443,9 +508,9 @@ impl VideoEditorApp {
                                 Ok(output) => {
                                     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                                     if output.status.success() {
-                                        let _ = tx.send(format!("Export succeeded: {}", out_path_abs.display()));
+                                        let _ = tx.send(format!("出力成功: {}", out_path_abs.display()));
                                     } else {
-                                        let _ = tx.send(format!("ffmpeg failed: status={} stderr={}", output.status, stderr));
+                                        let _ = tx.send(format!("出力失敗: status={} stderr={}", output.status, stderr));
                                     }
                                 }
                                 Err(e) => {
@@ -489,7 +554,7 @@ impl App for VideoEditorApp {
         // export スレッドからのメッセージをここで受け取り、受信があれば再描画要求を出す
         if let Some(rx) = &self.export_rx {
             let mut any = false;
-            // drain available messages
+            // チャネルにメッセージがある限り受信する
             loop {
                 match rx.try_recv() {
                     Ok(msg) => {
@@ -603,10 +668,7 @@ impl App for VideoEditorApp {
             });
         });
 
-        // 再生中はイベントが来ない環境でも定期的に update() を呼ぶよう要求する
-        if self.playing {
-            ctx.request_repaint_after(Duration::from_millis(16));
-        }
+        
     }
 }
 
