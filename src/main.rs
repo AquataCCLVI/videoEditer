@@ -14,11 +14,23 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const MAX_UPLOAD_DIM: u32 = 960;
 
 // 動画クリップをオブジェクトとして扱う
+#[derive(Clone)]
 struct VideoClip {
     video_path_input: String,
     size: (u32, u32),
     fps: f32,
     frames: Vec<Vec<u8>>,
+}
+
+// プレイリスト用のエントリ（フレームを保持）
+#[derive(Clone)]
+struct ClipEntry {
+    id: usize,
+    path: String,
+    size: (u32, u32),
+    fps: f32,
+    frames: Vec<Vec<u8>>,
+    color: egui::Color32,
 }
 
 impl VideoClip {
@@ -83,11 +95,12 @@ struct VideoEditorApp {
     texture: Option<egui::TextureHandle>, // 動画表示用テクスチャ
     playing: bool,
     last_update: Instant, // 最後にフレームを更新した時間
-    size: (u32, u32),
-    fps: f32,
-    frames: Vec<Vec<u8>>, // 動画フレーム
-    current_frame: usize,
-    current_clip: Option<VideoClip>,
+    // プレイリスト管理
+    playlist: Vec<ClipEntry>,
+    clip_offsets: Vec<usize>, // 各クリップ開始の累積フレーム数
+    total_frames: usize,
+    global_frame: usize, // 再生位置（全体のフレームインデックス）
+    current_clip_idx: usize,
     // タイムライン用サムネイルキャッシュ (frame_index, texture)
     timeline_thumbs: Vec<(usize, egui::TextureHandle)>,
     // サムネイル再生成フラグ
@@ -116,11 +129,11 @@ impl Default for VideoEditorApp {
             texture: None,
             playing: false,
             last_update: Instant::now(),
-            size: (1920, 1080),
-            fps: 60.0,
-            frames: Vec::new(),
-            current_frame: 0,
-            current_clip: None,
+            playlist: Vec::new(),
+            clip_offsets: Vec::new(),
+            total_frames: 0,
+            global_frame: 0,
+            current_clip_idx: 0,
             timeline_thumbs: Vec::new(),
             timeline_dirty: false,
             cut_start_sec: 0.0,
@@ -137,6 +150,66 @@ impl Default for VideoEditorApp {
 }
 
 impl VideoEditorApp {
+    // 累積オフセットを再計算
+    fn rebuild_offsets(&mut self) {
+        self.clip_offsets.clear();
+        let mut acc = 0usize;
+        for clip in &self.playlist {
+            self.clip_offsets.push(acc);
+            acc += clip.frames.len();
+        }
+        self.total_frames = acc;
+        if self.global_frame > self.total_frames.saturating_sub(1) {
+            self.global_frame = self.total_frames.saturating_sub(1);
+        }
+    }
+
+    // グローバルフレームから (clip_idx, local_idx) を取得
+    fn map_global(&self, g: usize) -> Option<(usize, usize)> {
+        if self.playlist.is_empty() || self.clip_offsets.is_empty() {
+            return None;
+        }
+        // 二分探索
+        match self.clip_offsets.binary_search(&g) {
+            Ok(idx) => Some((idx, 0)),
+            Err(pos) => {
+                if pos == 0 { return None; }
+                let clip_idx = pos - 1;
+                let local = g - self.clip_offsets[clip_idx];
+                Some((clip_idx, local))
+            }
+        }
+    }
+
+    fn current_clip(&self) -> Option<&ClipEntry> {
+        self.map_global(self.global_frame).and_then(|(ci, _)| self.playlist.get(ci))
+    }
+
+    fn current_clip_mut(&mut self) -> Option<&mut ClipEntry> {
+        let idx = self.map_global(self.global_frame).map(|(ci, _)| ci)?;
+        self.playlist.get_mut(idx)
+    }
+
+    // 指定クリップの先頭にシーク
+    fn seek_clip_start(&mut self, clip_idx: usize) {
+        if clip_idx < self.playlist.len() {
+            if let Some(off) = self.clip_offsets.get(clip_idx) {
+                self.global_frame = *off;
+                self.current_clip_idx = clip_idx;
+                self.timeline_dirty = true;
+            }
+        }
+    }
+
+    // 指定グローバルフレームにシーク
+    fn seek_global(&mut self, g: usize) {
+        if self.total_frames == 0 { return; }
+        self.global_frame = g.min(self.total_frames.saturating_sub(1));
+        if let Some((ci, _)) = self.map_global(self.global_frame) {
+            self.current_clip_idx = ci;
+        }
+    }
+
     fn draw_left_column(
         &mut self,
         ui: &mut egui::Ui,
@@ -152,33 +225,63 @@ impl VideoEditorApp {
             ui.painter()
                 .rect_filled(rect, 0.0, egui::Color32::from_rgb(240, 200, 200));
 
-            let mut view_child_ui = ui.child_ui(
-                rect,
+            // プレビュー領域を上下に分割（ラベル + 動画）
+            let label_height = 25.0;
+            let video_height = view_size.y - label_height;
+            
+            let label_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), label_height));
+            let video_rect = egui::Rect::from_min_size(
+                rect.min + egui::vec2(0.0, label_height),
+                egui::vec2(rect.width(), video_height),
+            );
+
+            // ラベル領域
+            let mut label_ui = ui.child_ui(
+                label_rect,
+                egui::Layout::left_to_right(egui::Align::Center),
+            );
+
+            // 選択中クリップ情報（ラベル領域に描画）
+            if let Some(clip) = self.current_clip() {
+                let fname = std::path::Path::new(&clip.path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&clip.path);
+                let secs = if clip.fps > 0.0 { clip.frames.len() as f32 / clip.fps } else { 0.0 };
+                label_ui.label(format!(
+                    "選択中: {}  {}x{}  {:.2}fps  {:.2}s",
+                    fname, clip.size.0, clip.size.1, clip.fps, secs
+                ));
+            }
+
+            // 動画表示領域
+            let mut video_ui = ui.child_ui(
+                video_rect,
                 egui::Layout::centered_and_justified(egui::Direction::TopDown),
             );
 
             // 表示
-
-            // 動画サイズに合わせて表示サイズを調整
-            let xsize = self.size.0 as f32;
-            let ysize = self.size.1 as f32;
-            let scale = if view_size.x / xsize < view_size.y / ysize {
-                view_size.x / xsize as f32
+            let (disp_w, disp_h) = if let Some(clip) = self.current_clip() {
+                clip.size
             } else {
-                view_size.y / ysize as f32
+                (640, 360)
+            };
+            let xsize = disp_w as f32;
+            let ysize = disp_h as f32;
+            let scale = if video_rect.width() / xsize < video_rect.height() / ysize {
+                video_rect.width() / xsize as f32
+            } else {
+                video_rect.height() / ysize as f32
             };
             let video_size = egui::vec2(xsize * scale, ysize * scale);
 
-            //読み込みが終わっていたらメッセージで伝える
-
-
-
             if let Some(texture) = &self.texture {
-                view_child_ui.image((texture.id(), video_size));
+                video_ui.image((texture.id(), video_size));
             } else {
-                view_child_ui.label("動画を読み込んでね！");
+                video_ui.label("動画を読み込んでね！");
             }
 
+            // タイムライン: クリップの長さに比例したバーを描画し、クリックでシーク
             let (rect, _res) = ui.allocate_exact_size(timeline_size, egui::Sense::hover());
             ui.painter()
                 .rect_filled(rect, 0.0, egui::Color32::from_rgb(200, 240, 200));
@@ -187,61 +290,71 @@ impl VideoEditorApp {
                 rect,
                 egui::Layout::centered_and_justified(egui::Direction::TopDown),
             );
-            //timeline_child_ui.label("タイムライン");
 
-            // タイムラインに数秒ごとのサムネイルを並べる
-            let ctx = ui.ctx();
-            // 間隔（秒） -- 必要ならUIで変更可能にする
-            let interval_sec = 1.0_f32;
-            if !self.frames.is_empty() {
-                // 再生成が必要なら作る
-                if self.timeline_dirty {
-                    // 既存テクスチャを drop して再生成
-                    self.timeline_thumbs.clear();
-                    let total = self.frames.len();
-                    let step = ((self.fps * interval_sec).round() as usize).max(1);
-                    // サムネイルサイズ（小さめ）
-                    let thumb_w = 160u32;
-                    let thumb_h = 90u32;
-                    for idx in (0..total).step_by(step) {
-                        let frame = &self.frames[idx];
-                        // 簡易ダウンサンプリング nearest
-                        let src_w = self.size.0;
-                        let src_h = self.size.1;
-                        let mut out = vec![0u8; (thumb_w as usize) * (thumb_h as usize) * 3];
-                        for y in 0..thumb_h {
-                            for x in 0..thumb_w {
-                                let src_x = ((x as f32) * (src_w as f32 / thumb_w as f32)) as u32;
-                                let src_y = ((y as f32) * (src_h as f32 / thumb_h as f32)) as u32;
-                                let src_idx = ((src_y * src_w + src_x) as usize) * 3;
-                                let dst_idx = ((y * thumb_w + x) as usize) * 3;
-                                out[dst_idx..dst_idx + 3].copy_from_slice(&frame[src_idx..src_idx + 3]);
+            if self.total_frames > 0 {
+                let total_w = timeline_size.x - 20.0;
+                timeline_child_ui.horizontal(|ui| {
+                    let mut clicked_global: Option<usize> = None;
+                    let current = self.map_global(self.global_frame);
+                    for (idx, clip) in self.playlist.iter().enumerate() {
+                        let start = self.clip_offsets[idx] as f32;
+                        let end = start + clip.frames.len() as f32;
+                        let ratio = clip.frames.len() as f32 / self.total_frames as f32;
+                        let width = (total_w * ratio).max(8.0);
+                        let height = 40.0;
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(width, height),
+                            egui::Sense::click(),
+                        );
+                        ui.painter().rect_filled(rect, 4.0, clip.color);
+                        // 選択中クリップを太枠で強調
+                        if idx == self.current_clip_idx {
+                            ui.painter().rect_stroke(
+                                rect,
+                                4.0,
+                                egui::Stroke { width: 3.0, color: egui::Color32::YELLOW },
+                            );
+                        }
+                        // 現在位置のプレイヘッド線（このクリップ内の場合のみ）
+                        if let Some((ci, local)) = current {
+                            if ci == idx && !clip.frames.is_empty() {
+                                let local_ratio = (local as f32 / clip.frames.len() as f32).clamp(0.0, 1.0);
+                                let x = rect.min.x + rect.width() * local_ratio;
+                                let top = rect.top();
+                                let bottom = rect.bottom();
+                                ui.painter().line_segment(
+                                    [egui::pos2(x, top), egui::pos2(x, bottom)],
+                                    egui::Stroke { width: 2.0, color: egui::Color32::BLACK },
+                                );
                             }
                         }
-                        let color_image = egui::ColorImage::from_rgb([thumb_w as usize, thumb_h as usize], &out);
-                        let tex = ctx.load_texture(&format!("thumb_{}", idx), color_image, egui::TextureOptions::LINEAR);
-                        self.timeline_thumbs.push((idx, tex));
+                        if resp.clicked() {
+                            // クリック位置をローカル比率に変換してシーク
+                            let local_ratio = ((resp.interact_pointer_pos().unwrap().x - rect.min.x)
+                                / rect.width())
+                                .clamp(0.0, 1.0);
+                            let local_frame = (clip.frames.len() as f32 * local_ratio).floor() as usize;
+                            let g = self.clip_offsets[idx] + local_frame;
+                            clicked_global = Some(g.min(self.total_frames.saturating_sub(1)));
+                        }
+                        let label = format!("{}: {:.1}s", idx + 1, clip.frames.len() as f32 / clip.fps);
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            label,
+                            egui::FontId::proportional(12.0),
+                            egui::Color32::BLACK,
+                        );
                     }
-                    self.timeline_dirty = false;
-                }
-
-                // 描画: 横スクロール可能にする
-                let mut scroll = egui::containers::ScrollArea::horizontal();
-                scroll.show(&mut timeline_child_ui, |ui| {
-                    ui.horizontal(|ui| {
-                        for (idx, tex) in &self.timeline_thumbs {
-                            let size = egui::vec2(160.0, 90.0);
-                            // 画像をボタンにしてクリックでそのフレームへ移動
-                            if ui.add(egui::ImageButton::new((tex.id(), size))).clicked() {
-                                self.current_frame = *idx;
-                            }
-                        }
-                    });
+                    if let Some(g) = clicked_global {
+                        self.seek_global(g);
+                    }
                 });
+            } else {
+                timeline_child_ui.label("タイムライン");
             }
         });
 
-        // export_rx のポーリングは update() 側で行う（再描画要求を出せるように）
     }
 
     fn draw_right_column(&mut self, ui: &mut egui::Ui, option_size: egui::Vec2) {
@@ -261,121 +374,34 @@ impl VideoEditorApp {
             });
 
             if ui.button("読み込み").clicked() {
-                // バックグラウンドスレッドで読み込み、進捗をチャネルで送信
-                let (tx, rx) = channel::<String>();
-                self.load_status = Some("読み込み開始".to_string());
-                self.load_rx = Some(rx);
-
-                let path = self.video_path_input.clone();
-                thread::spawn(move || {
-                    let _ = tx.send("動画ファイルを開いています...".to_string());
-                    
-                    match ffmpeg::format::input(&path) {
-                        Ok(mut ictx) => {
-                            let _ = tx.send("ストリーム情報を解析中...".to_string());
-                            
-                            let input = match ictx.streams().best(ffmpeg::media::Type::Video) {
-                                Some(s) => s,
-                                None => {
-                                    let _ = tx.send("エラー: 映像ストリームが見つかりません".to_string());
-                                    return;
-                                }
-                            };
-                            
-                            let video_stream_index = input.index();
-                            let fps = input.avg_frame_rate();
-                            let fps_val = if fps.1 != 0 {
-                                fps.0 as f32 / fps.1 as f32
-                            } else {
-                                60.0
-                            };
-
-                            let context_decoder = match ffmpeg::codec::context::Context::from_parameters(input.parameters()) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    let _ = tx.send(format!("エラー: デコーダ初期化失敗 {}", e));
-                                    return;
-                                }
-                            };
-                            
-                            let mut decoder = match context_decoder.decoder().video() {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    let _ = tx.send(format!("エラー: デコーダ取得失敗 {}", e));
-                                    return;
-                                }
-                            };
-
-                            let mut scaler = match ffmpeg::software::scaling::context::Context::get(
-                                decoder.format(),
-                                decoder.width(),
-                                decoder.height(),
-                                ffmpeg::format::Pixel::RGB24,
-                                decoder.width(),
-                                decoder.height(),
-                                ffmpeg::software::scaling::flag::Flags::BILINEAR,
-                            ) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    let _ = tx.send(format!("エラー: スケーラー初期化失敗 {}", e));
-                                    return;
-                                }
-                            };
-
-                            let _ = tx.send(format!("フレームをデコード中 ({}x{}, {:.2}fps)...", decoder.width(), decoder.height(), fps_val));
-
-                            let mut frames: Vec<Vec<u8>> = Vec::new();
-                            let mut decoded = ffmpeg::util::frame::video::Video::empty();
-                            let mut frame_count = 0;
-
-                            for (stream, packet) in ictx.packets() {
-                                if stream.index() == video_stream_index {
-                                    if decoder.send_packet(&packet).is_ok() {
-                                        while decoder.receive_frame(&mut decoded).is_ok() {
-                                            let mut rgb_frame = ffmpeg::util::frame::video::Video::empty();
-                                            if scaler.run(&decoded, &mut rgb_frame).is_ok() {
-                                                frames.push(rgb_frame.data(0).to_vec());
-                                                frame_count += 1;
-                                                
-                                                // 100フレームごとに進捗を送信
-                                                if frame_count % 100 == 0 {
-                                                    let _ = tx.send(format!("{}フレーム読み込み完了", frame_count));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            let _ = tx.send(format!("読み込み完了: {}フレーム", frames.len()));
-
-                            // 完了データをシリアライズして送信（JSON形式で送る）
-                            // ここでは簡易的にフォーマット文字列で送信
-                            let clip = VideoClip {
-                                video_path_input: path.clone(),
-                                size: (decoder.width(), decoder.height()),
-                                fps: fps_val,
-                                frames,
-                            };
-                            
-                            // クリップデータはチャネル経由では送れないので、完了メッセージのみ送信
-                            // 実際のデータ転送は後で考慮（今回は Arc<Mutex> か別の方法が必要）
-                            let _ = tx.send(format!("LOAD_COMPLETE|{}|{}|{}|{}", 
-                                clip.video_path_input, 
-                                clip.size.0, 
-                                clip.size.1, 
-                                clip.fps
-                            ));
-                            
-                            // フレームデータはここでは送れないので、代替案として
-                            // once_cell や Arc<Mutex<Option<VideoClip>>> を使う必要がある
-                            // 今回は簡易実装として、完了後に再度同期ロードする形にする
-                        }
-                        Err(e) => {
-                            let _ = tx.send(format!("エラー: ファイルを開けません {}", e));
-                        }
+                match VideoClip::load(&self.video_path_input) {
+                    Ok(clip) => {
+                        let color = egui::Color32::from_rgb(
+                            (50 + (self.playlist.len() * 70 % 200)) as u8,
+                            (80 + (self.playlist.len() * 90 % 150)) as u8,
+                            (100 + (self.playlist.len() * 60 % 155)) as u8,
+                        );
+                        let entry = ClipEntry {
+                            id: self.playlist.len(),
+                            path: clip.video_path_input.clone(),
+                            size: clip.size,
+                            fps: clip.fps,
+                            frames: clip.frames,
+                            color,
+                        };
+                        self.playlist.push(entry);
+                        self.rebuild_offsets();
+                        self.global_frame = self.total_frames.saturating_sub(1);
+                        self.current_clip_idx = self.playlist.len().saturating_sub(1);
+                        self.timeline_dirty = true;
+                        self.playing = false;
+                        self.last_update = Instant::now();
+                        self.load_status = Some("読み込み完了".to_string());
                     }
-                });
+                    Err(e) => {
+                        self.load_status = Some(format!("エラー: {}", e));
+                    }
+                }
             }
 
             if ui
@@ -392,7 +418,7 @@ impl VideoEditorApp {
 
             ui.horizontal(|ui| {
                 if ui.button("最初から").clicked() {
-                    self.current_frame = 0;
+                    self.seek_global(0);
                 }
 
             });
@@ -409,61 +435,54 @@ impl VideoEditorApp {
 
             ui.horizontal(|ui| {
                 if ui.button("指定範囲を切り取る").clicked() {
-                    // 秒 -> フレームインデックス
-                    if self.fps > 0.0 && !self.frames.is_empty() {
-                        let total_frames = self.frames.len();
-                        let mut start_f = (self.cut_start_sec * self.fps).round() as isize;
-                        let mut end_f = (self.cut_end_sec * self.fps).round() as isize;
-                        // 負の数は0に補正
-                        if start_f < 0 { start_f = 0; }
-                        // 負の数、または0は最後までに補正
-                        if end_f <= 0 { end_f = total_frames as isize; }
-                        let mut s = start_f as usize;
-                        let mut e = end_f as usize;
-                        if s > total_frames { s = total_frames; }
-                        if e > total_frames { e = total_frames; }
-                        if s > e { std::mem::swap(&mut s, &mut e); }
+                    if let Some((ci, _)) = self.map_global(self.global_frame) {
+                        if let Some(clip) = self.playlist.get_mut(ci) {
+                            if clip.fps > 0.0 && !clip.frames.is_empty() {
+                                let total_frames = clip.frames.len();
+                                let mut start_f = (self.cut_start_sec * clip.fps).round() as isize;
+                                let mut end_f = (self.cut_end_sec * clip.fps).round() as isize;
+                                if start_f < 0 { start_f = 0; }
+                                if end_f <= 0 { end_f = total_frames as isize; }
+                                let mut s = start_f as usize;
+                                let mut e = end_f as usize;
+                                if s > total_frames { s = total_frames; }
+                                if e > total_frames { e = total_frames; }
+                                if s > e { std::mem::swap(&mut s, &mut e); }
 
-                        if s < e {
-                            // 指定範囲を削除
-                            self.frames.drain(s..e);
-                            // 先頭から削った場合は audio_offset_frames を調整
-                            if s == 0 {
-                                self.audio_offset_frames = self
-                                    .audio_offset_frames
-                                    .saturating_add(e - s);
+                                if s < e {
+                                    clip.frames.drain(s..e);
+                                    self.rebuild_offsets();
+                                    self.seek_clip_start(ci);
+                                    self.timeline_dirty = true;
+                                }
                             }
-                            // current_frame が範囲内にある場合は s に移動
-                            self.current_frame = s.min(self.frames.len());
-                            // サムネイル再生成フラグ
-                            self.timeline_dirty = true;
                         }
                     }
                 }
 
                 if ui.button("指定範囲を抽出（その範囲だけ残す）").clicked() {
-                    if self.fps > 0.0 && !self.frames.is_empty() {
-                        let total_frames = self.frames.len();
-                        let mut start_f = (self.cut_start_sec * self.fps).round() as isize;
-                        let mut end_f = (self.cut_end_sec * self.fps).round() as isize;
-                        if start_f < 0 { start_f = 0; }
-                        if end_f < 0 { end_f = 0; }
-                        let mut s = start_f as usize;
-                        let mut e = end_f as usize;
-                        if s > total_frames { s = total_frames; }
-                        if e > total_frames { e = total_frames; }
-                        if s > e { std::mem::swap(&mut s, &mut e); }
+                    if let Some((ci, _)) = self.map_global(self.global_frame) {
+                        if let Some(clip) = self.playlist.get_mut(ci) {
+                            if clip.fps > 0.0 && !clip.frames.is_empty() {
+                                let total_frames = clip.frames.len();
+                                let mut start_f = (self.cut_start_sec * clip.fps).round() as isize;
+                                let mut end_f = (self.cut_end_sec * clip.fps).round() as isize;
+                                if start_f < 0 { start_f = 0; }
+                                if end_f < 0 { end_f = 0; }
+                                let mut s = start_f as usize;
+                                let mut e = end_f as usize;
+                                if s > total_frames { s = total_frames; }
+                                if e > total_frames { e = total_frames; }
+                                if s > e { std::mem::swap(&mut s, &mut e); }
 
-                        if s < e {
-                            let new_frames: Vec<Vec<u8>> = self.frames[s..e].to_vec();
-                            // 先頭から抽出した場合は audio_offset_frames を調整
-                            self.audio_offset_frames = self
-                                .audio_offset_frames
-                                .saturating_add(s);
-                            self.frames = new_frames;
-                            self.current_frame = 0;
-                            // サムネイル再生成フラグ
-                            self.timeline_dirty = true;
+                                if s < e {
+                                    let new_frames: Vec<Vec<u8>> = clip.frames[s..e].to_vec();
+                                    clip.frames = new_frames;
+                                    self.rebuild_offsets();
+                                    self.seek_clip_start(ci);
+                                    self.timeline_dirty = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -484,135 +503,83 @@ impl VideoEditorApp {
                 let (tx, rx) = channel::<String>();
                 self.export_status = Some("エクスポート開始".to_string());
                 self.export_rx = Some(rx);
-
                 let out = self.output_path.clone();
-                let frames = self.frames.clone();
                 let include_audio = self.include_audio;
-                let audio_source = self
-                    .current_clip
-                    .as_ref()
-                    .map(|c| c.video_path_input.clone());
-                let (w, h) = self.size;
-                let fps = self.fps;
-                let audio_offset_frames = self.audio_offset_frames;
+                let playlist = self.playlist.clone();
 
                 thread::spawn(move || {
-                    if frames.is_empty() {
-                        let _ = tx.send("フレームがありません！".to_string());
+                    if playlist.is_empty() {
+                        let _ = tx.send("プレイリストが空です".to_string());
                         return;
                     }
 
-                        // Stream frames directly to ffmpeg stdin (rawvideo) to avoid PNG save overhead
-                        let _ = tx.send("Starting ffmpeg (stdin rawvideo)".to_string());
+                    let out_path_abs = if std::path::Path::new(&out).is_absolute() {
+                        std::path::PathBuf::from(&out)
+                    } else {
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")).join(&out)
+                    };
 
-                        // output path absolute
-                        let out_path_abs = if std::path::Path::new(&out).is_absolute() {
-                            std::path::PathBuf::from(&out)
-                        } else {
-                            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")).join(&out)
-                        };
+                    let mut args: Vec<String> = Vec::new();
+                    args.push("-y".to_string());
 
-                        // build ffmpeg args for rawvideo on stdin
-                        let mut args: Vec<String> = Vec::new();
-                        args.push("-y".to_string());
-                        args.push("-f".to_string());
-                        args.push("rawvideo".to_string());
-                        args.push("-pix_fmt".to_string());
-                        args.push("rgb24".to_string());
-                        args.push("-s".to_string());
-                        args.push(format!("{}x{}", w, h));
-                        args.push("-r".to_string());
-                        args.push(format!("{}", fps));
+                    // クリップをそれぞれ入力として渡す
+                    for clip in &playlist {
                         args.push("-i".to_string());
-                        args.push("pipe:0".to_string());
+                        args.push(clip.path.clone());
+                    }
 
-                        // audio input
-                        if include_audio {
-                            if let Some(audio_path) = audio_source {
-                                // 元動画から音声トラックを取得
-                                // オフセット分を考慮して開始位置を調整
-                                let audio_start_sec = (audio_offset_frames as f64) / (fps as f64);
-                                if audio_start_sec > 0.0 {
-                                    args.push("-ss".to_string());
-                                    args.push(format!("{:.3}", audio_start_sec));
-                                }
+                    // filter_complex を構築
+                    let n = playlist.len();
+                    let mut filter = String::new();
+                    for i in 0..n {
+                        filter.push_str(&format!("[{}:v][{}:a]", i, i));
+                    }
+                    if include_audio {
+                        filter.push_str(&format!("concat=n={}:v=1:a=1[outv][outa]", n));
+                    } else {
+                        // 音声なし
+                        for i in 0..n {
+                            filter.push_str(&format!("[{}:v]", i));
+                        }
+                        filter.push_str(&format!("concat=n={}:v=1:a=0[outv]", n));
+                    }
 
-                                // 動画の長さに合わせて音声も切り取る
-                                let duration_sec = if fps > 0.0 {
-                                    (frames.len() as f64) / (fps as f64)
-                                } else {
-                                    0.0
-                                };
-                                if duration_sec > 0.0 {
-                                    args.push("-t".to_string());
-                                    args.push(format!("{:.3}", duration_sec));
-                                }
+                    args.push("-filter_complex".to_string());
+                    args.push(filter);
+                    args.push("-map".to_string());
+                    args.push("[outv]".to_string());
+                    if include_audio {
+                        args.push("-map".to_string());
+                        args.push("[outa]".to_string());
+                    }
+                    args.push("-c:v".to_string());
+                    args.push("libx264".to_string());
+                    if include_audio {
+                        args.push("-c:a".to_string());
+                        args.push("aac".to_string());
+                    }
+                    args.push(out_path_abs.to_string_lossy().to_string());
 
-                                args.push("-i".to_string());
-                                args.push(audio_path.clone());
-                                // マッピング
-                                args.push("-map".to_string());
-                                args.push("0:v:0".to_string());
-                                args.push("-map".to_string());
-                                args.push("1:a:0".to_string());
+                    let _ = tx.send("ffmpeg concat で書き出し中...".to_string());
+
+                    let output = Command::new("ffmpeg")
+                        .args(&args)
+                        .stderr(std::process::Stdio::piped())
+                        .output();
+
+                    match output {
+                        Ok(outp) => {
+                            let stderr = String::from_utf8_lossy(&outp.stderr).to_string();
+                            if outp.status.success() {
+                                let _ = tx.send(format!("出力成功: {}", out_path_abs.display()));
+                            } else {
+                                let _ = tx.send(format!("出力失敗: status={} stderr={}", outp.status, stderr));
                             }
                         }
-
-                        args.push("-c:v".to_string());
-                        args.push("libx264".to_string());
-                        args.push("-pix_fmt".to_string());
-                        args.push("yuv420p".to_string());
-
-                        if include_audio {
-                            args.push("-c:a".to_string());
-                            args.push("aac".to_string());
-                            args.push("-b:a".to_string());
-                            args.push("192k".to_string());
-                            args.push("-shortest".to_string());
+                        Err(e) => {
+                            let _ = tx.send(format!("ffmpeg起動失敗: {}", e));
                         }
-
-                        args.push(out_path_abs.to_string_lossy().to_string());
-
-                        let mut child = match Command::new("ffmpeg").args(&args).stdin(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
-                            Ok(c) => c,
-                            Err(e) => {
-                                let _ = tx.send(format!("ffmepg起動失敗: {}", e));
-                                return;
-                            }
-                        };
-
-                        // ffmpeg の stdin にフレームを書き込む
-                        if let Some(mut stdin) = child.stdin.take() {
-                            let total = frames.len();
-                            for (i, fr) in frames.iter().enumerate() {
-                                
-                                let _ = tx.send(format!("フレームを書き込み中: {}/{}", i, total));
-                                
-                                if let Err(e) = stdin.write_all(fr) {
-                                    let _ = tx.send(format!("書き込みに失敗しました {}: {}", i, e));
-                                    break;
-                                }
-                            }
-                            // close stdin to signal EOF
-                            drop(stdin);
-
-                            // wait for ffmpeg to finish and capture stderr
-                            match child.wait_with_output() {
-                                Ok(output) => {
-                                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                                    if output.status.success() {
-                                        let _ = tx.send(format!("出力成功: {}", out_path_abs.display()));
-                                    } else {
-                                        let _ = tx.send(format!("出力失敗: status={} stderr={}", output.status, stderr));
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(format!("failed waiting for ffmpeg: {}", e));
-                                }
-                            }
-                        } else {
-                            let _ = tx.send("failed to open ffmpeg stdin".to_string());
-                        }
+                    }
                 });
             }
             if let Some(status) = &self.export_status {
@@ -648,60 +615,7 @@ impl App for VideoEditorApp {
             .insert(0, "keifont".to_owned());
         ctx.set_fonts(fonts);
 
-        // 読み込みスレッドからのメッセージを受信
-        let mut load_complete = false;
-        if let Some(rx) = &self.load_rx {
-            let mut any = false;
-            loop {
-                match rx.try_recv() {
-                    Ok(msg) => {
-                        // LOAD_COMPLETE メッセージが来たら同期的に再ロード
-                        if msg.starts_with("LOAD_COMPLETE|") {
-                            self.load_status = Some("フレームデータを取り込み中...".to_string());
-                            // 同期的にVideoClip::loadを再度呼ぶ（改善余地あり）
-                            match VideoClip::load(&self.video_path_input) {
-                                Ok(clip) => {
-                                    self.size = clip.size;
-                                    self.fps = clip.fps;
-                                    self.frames = clip.frames;
-                                    self.timeline_dirty = true;
-                                    self.current_frame = 0;
-                                    self.current_clip = Some(VideoClip {
-                                        video_path_input: clip.video_path_input,
-                                        size: clip.size,
-                                        fps: clip.fps,
-                                        frames: Vec::new(),
-                                    });
-                                    self.audio_offset_frames = 0;
-                                    self.playing = false;
-                                    self.last_update = Instant::now();
-                                    self.load_status = Some("読み込み完了".to_string());
-                                    load_complete = true;
-                                }
-                                Err(e) => {
-                                    self.load_status = Some(format!("エラー: {}", e));
-                                    load_complete = true;
-                                }
-                            }
-                        } else {
-                            self.load_status = Some(msg.clone());
-                        }
-                        any = true;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        load_complete = true;
-                        break;
-                    }
-                }
-            }
-            if any {
-                ctx.request_repaint();
-            }
-        }
-        if load_complete {
-            self.load_rx = None;
-        }
+        // 読み込み進捗のポーリング（現在は同期ロードのため未使用）
 
         // export スレッドからのメッセージをここで受け取り、受信があれば再描画要求を出す
         if let Some(rx) = &self.export_rx {
@@ -734,68 +648,69 @@ impl App for VideoEditorApp {
         }
 
 
-        if self.playing && !self.frames.is_empty() {
-            let now = Instant::now();
-            let frame_duration = Duration::from_secs_f32(1.0 / self.fps);
+        if self.playing && self.total_frames > 0 {
+            if let Some((ci, local_idx)) = self.map_global(self.global_frame) {
+                if let Some(clip) = self.playlist.get(ci) {
+                    let now = Instant::now();
+                    let frame_duration = Duration::from_secs_f32(1.0 / clip.fps.max(1.0));
+                    if now.duration_since(self.last_update) >= frame_duration {
+                        self.last_update = now;
 
-            if now.duration_since(self.last_update) >= frame_duration {
-                self.last_update = now;
+                        if local_idx < clip.frames.len() {
+                            let frame = &clip.frames[local_idx];
+                            let src_w = clip.size.0;
+                            let src_h = clip.size.1;
+                            let mut dst_w = src_w;
+                            let mut dst_h = src_h;
+                            if src_w > MAX_UPLOAD_DIM || src_h > MAX_UPLOAD_DIM {
+                                let scale = (MAX_UPLOAD_DIM as f32 / src_w as f32)
+                                    .min(MAX_UPLOAD_DIM as f32 / src_h as f32);
+                                dst_w = (src_w as f32 * scale).max(1.0) as u32;
+                                dst_h = (src_h as f32 * scale).max(1.0) as u32;
+                            }
 
-                if self.current_frame < self.frames.len() {
-                    let frame = &self.frames[self.current_frame];
-                    // アップロード前に表示用に縮小しておく（簡易 nearest-neighbor）
-                    let src_w = self.size.0;
-                    let src_h = self.size.1;
-                    let mut dst_w = src_w;
-                    let mut dst_h = src_h;
-                    if src_w > MAX_UPLOAD_DIM || src_h > MAX_UPLOAD_DIM {
-                        let scale = (MAX_UPLOAD_DIM as f32 / src_w as f32)
-                            .min(MAX_UPLOAD_DIM as f32 / src_h as f32);
-                        dst_w = (src_w as f32 * scale).max(1.0) as u32;
-                        dst_h = (src_h as f32 * scale).max(1.0) as u32;
-                    }
+                            let upload_buffer_vec: Option<Vec<u8>> = if dst_w != src_w || dst_h != src_h {
+                                let mut out = vec![0u8; (dst_w as usize) * (dst_h as usize) * 3];
+                                for y in 0..dst_h {
+                                    for x in 0..dst_w {
+                                        let src_x = ((x as f32) * (src_w as f32 / dst_w as f32)) as u32;
+                                        let src_y = ((y as f32) * (src_h as f32 / dst_h as f32)) as u32;
+                                        let src_idx = ((src_y * src_w + src_x) as usize) * 3;
+                                        let dst_idx = ((y * dst_w + x) as usize) * 3;
+                                        out[dst_idx..dst_idx + 3]
+                                            .copy_from_slice(&frame[src_idx..src_idx + 3]);
+                                    }
+                                }
+                                Some(out)
+                            } else {
+                                None
+                            };
 
-                    let upload_buffer_vec: Option<Vec<u8>> = if dst_w != src_w || dst_h != src_h {
-                        // 簡易ダウンサンプリング（nearest） - 出力を新しい Vec に作る
-                        let mut out = vec![0u8; (dst_w as usize) * (dst_h as usize) * 3];
-                        for y in 0..dst_h {
-                            for x in 0..dst_w {
-                                let src_x = ((x as f32) * (src_w as f32 / dst_w as f32)) as u32;
-                                let src_y = ((y as f32) * (src_h as f32 / dst_h as f32)) as u32;
-                                let src_idx = ((src_y * src_w + src_x) as usize) * 3;
-                                let dst_idx = ((y * dst_w + x) as usize) * 3;
-                                out[dst_idx..dst_idx + 3]
-                                    .copy_from_slice(&frame[src_idx..src_idx + 3]);
+                            let color_image = if let Some(buf) = upload_buffer_vec {
+                                egui::ColorImage::from_rgb([dst_w as usize, dst_h as usize], &buf)
+                            } else {
+                                egui::ColorImage::from_rgb([dst_w as usize, dst_h as usize], &frame)
+                            };
+                            if let Some(tex) = &mut self.texture {
+                                tex.set(color_image, egui::TextureOptions::LINEAR);
+                            } else {
+                                self.texture = Some(ctx.load_texture(
+                                    "video_preview",
+                                    color_image,
+                                    egui::TextureOptions::LINEAR,
+                                ));
                             }
                         }
-                        Some(out)
-                    } else {
-                        None
-                    };
 
-                    let color_image = if let Some(buf) = upload_buffer_vec {
-                        egui::ColorImage::from_rgb([dst_w as usize, dst_h as usize], &buf)
-                    } else {
-                        egui::ColorImage::from_rgb([dst_w as usize, dst_h as usize], &frame)
-                    };
-                    if let Some(tex) = &mut self.texture {
-                        tex.set(color_image, egui::TextureOptions::LINEAR);
-                    } else {
-                        self.texture = Some(ctx.load_texture(
-                            "video_preview",
-                            color_image,
-                            egui::TextureOptions::LINEAR,
-                        ));
+                        // 次フレームへ
+                        if self.global_frame + 1 < self.total_frames {
+                            self.global_frame += 1;
+                        } else {
+                            self.playing = false;
+                        }
+                        ctx.request_repaint();
                     }
-                    self.current_frame += 1;
                 }
-
-                // フレーム終了時の処理
-                ctx.request_repaint();
-            }
-
-            if self.frames.is_empty() {
-                self.playing = false;
             }
         }
 
