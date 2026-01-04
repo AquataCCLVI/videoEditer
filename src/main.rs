@@ -3,11 +3,184 @@ use ffmpeg_next as ffmpeg;
 use image::RgbImage;
 use std::default::Default;
 use std::fs;
-use std::io::Write;
 use std::process::Command;
 use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Debug)]
+struct SubtitleItem {
+    start_ms: u64,
+    end_ms: u64,
+    text: String,
+}
+
+fn parse_srt_to_items(srt: &str) -> Vec<SubtitleItem> {
+    let mut items = Vec::<SubtitleItem>::new();
+    let mut current_start: Option<u64> = None;
+    let mut current_end: Option<u64> = None;
+    let mut current_text_lines: Vec<String> = Vec::new();
+
+    let flush = |items: &mut Vec<SubtitleItem>,
+                     current_start: &mut Option<u64>,
+                     current_end: &mut Option<u64>,
+                     current_text_lines: &mut Vec<String>| {
+        if let (Some(start), Some(end)) = (*current_start, *current_end) {
+            let text = current_text_lines.join("\n").trim().to_string();
+            if !text.is_empty() && end > start {
+                items.push(SubtitleItem {
+                    start_ms: start,
+                    end_ms: end,
+                    text,
+                });
+            }
+        }
+        *current_start = None;
+        *current_end = None;
+        current_text_lines.clear();
+    };
+
+    for raw_line in srt.lines() {
+        let line = raw_line.trim_end_matches(['\r', '\n']);
+        let t = line.trim();
+        if t.is_empty() {
+            flush(
+                &mut items,
+                &mut current_start,
+                &mut current_end,
+                &mut current_text_lines,
+            );
+            continue;
+        }
+
+        // SRT index line (e.g., "1")
+        if current_start.is_none() && current_end.is_none() && t.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        // timecode line
+        if t.contains("-->") {
+            // start/end already set? flush and start new.
+            if current_start.is_some() || current_end.is_some() || !current_text_lines.is_empty() {
+                flush(
+                    &mut items,
+                    &mut current_start,
+                    &mut current_end,
+                    &mut current_text_lines,
+                );
+            }
+            let mut parts = t.split("-->");
+            let start_str = parts.next().unwrap_or("").trim();
+            let end_str = parts.next().unwrap_or("").trim();
+            if let (Some(start), Some(end)) = (parse_srt_time_ms(start_str), parse_srt_time_ms(end_str)) {
+                current_start = Some(start);
+                current_end = Some(end);
+            }
+            continue;
+        }
+
+        // text line
+        if current_start.is_some() && current_end.is_some() {
+            current_text_lines.push(t.to_string());
+        }
+    }
+
+    // flush last
+    flush(
+        &mut items,
+        &mut current_start,
+        &mut current_end,
+        &mut current_text_lines,
+    );
+
+    items
+}
+
+fn parse_srt_time_ms(s: &str) -> Option<u64> {
+    // Accept: HH:MM:SS,mmm or HH:MM:SS.mmm
+    // Also accept: MM:SS,mmm or MM:SS.mmm
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (main, frac) = if let Some(pos) = s.rfind([',', '.']) {
+        let (a, b) = s.split_at(pos);
+        (a, Some(&b[1..]))
+    } else {
+        (s, None)
+    };
+
+    let parts: Vec<&str> = main.split(':').collect();
+    let (h, m, sec) = match parts.len() {
+        3 => (
+            parts[0].trim().parse::<u64>().ok()?,
+            parts[1].trim().parse::<u64>().ok()?,
+            parts[2].trim().parse::<u64>().ok()?,
+        ),
+        2 => (
+            0,
+            parts[0].trim().parse::<u64>().ok()?,
+            parts[1].trim().parse::<u64>().ok()?,
+        ),
+        _ => return None,
+    };
+
+    let mut ms = 0u64;
+    if let Some(frac) = frac {
+        let digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            // normalize to milliseconds
+            let v = digits.parse::<u64>().ok()?;
+            ms = match digits.len() {
+                1 => v * 100,
+                2 => v * 10,
+                3 => v,
+                _ => {
+                    // more than 3 digits: truncate
+                    let p = 10u64.pow((digits.len() as u32).saturating_sub(3));
+                    v / p
+                }
+            };
+        }
+    }
+
+    Some(((h * 3600 + m * 60 + sec) * 1000) + ms)
+}
+
+fn ass_time_from_ms(ms: u64) -> String {
+    // ASS uses h:mm:ss.cc (centiseconds)
+    let total_cs = ms / 10;
+    let cs = total_cs % 100;
+    let total_s = total_cs / 100;
+    let s = total_s % 60;
+    let total_m = total_s / 60;
+    let m = total_m % 60;
+    let h = total_m / 60;
+    format!("{}:{:02}:{:02}.{:02}", h, m, s, cs)
+}
+
+fn escape_ass_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' => out.push_str("\\N"),
+            '{' => out.push_str("\\{"),
+            '}' => out.push_str("\\}"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn escape_ffmpeg_filter_path(path: &std::path::Path) -> String {
+    // ffmpeg filter graph parsing is picky on Windows (drive letter ':' etc)
+    // Use forward slashes and escape ':' and '\''.
+    let mut s = path.to_string_lossy().replace('\\', "/");
+    s = s.replace(':', "\\:");
+    s = s.replace('"', "\\\"");
+    s = s.replace('\'', "\\\'");
+    s
+}
 
 // アップロード時に大きすぎるフレームを縮小するための最大幅・高さ
 const MAX_UPLOAD_DIM: u32 = 960;
@@ -165,6 +338,10 @@ struct VideoEditorApp {
     // 音声関連設定
     include_audio: bool,        // エクスポート時に元動画の音声トラックを含める
     audio_offset_frames: usize, // frames[0] が元動画の何フレーム目に相当するか（音声同期用オフセット）
+
+    // 字幕（焼き込み用）
+    burn_subtitles: bool,
+    subtitles_srt: String,
 }
 
 impl Default for VideoEditorApp {
@@ -191,6 +368,9 @@ impl Default for VideoEditorApp {
             load_rx: None,
             include_audio: true,
             audio_offset_frames: 0,
+
+            burn_subtitles: false,
+            subtitles_srt: "".to_string(),
         }
     }
 }
@@ -576,6 +756,19 @@ impl VideoEditorApp {
                 ui.checkbox(&mut self.include_audio, "元動画の音声を含める");
             });
 
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.burn_subtitles, "字幕を焼き込む");
+            });
+            if self.burn_subtitles {
+                ui.label("字幕（SRT形式）を貼り付け:");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.subtitles_srt)
+                        .desired_rows(8)
+                        .hint_text("例:\n1\n00:00:01,000 --> 00:00:03,000\nこんにちは\n\n2\n00:00:04,000 --> 00:00:06,000\n字幕だよ"),
+                );
+            }
+
             if ui.button("書き出し").clicked() {
                 // set up channel and spawn thread so we can receive status messages
                 let (tx, rx) = channel::<String>();
@@ -584,6 +777,8 @@ impl VideoEditorApp {
                 let out = self.output_path.clone();
                 let include_audio = self.include_audio;
                 let playlist = self.playlist.clone();
+                let burn_subtitles = self.burn_subtitles;
+                let subtitles_srt = self.subtitles_srt.clone();
 
                 thread::spawn(move || {
                     if playlist.is_empty() {
@@ -624,10 +819,68 @@ impl VideoEditorApp {
                         filter.push_str(&format!("concat=n={}:v=1:a=0[outv]", n));
                     }
 
+                    // 字幕を焼き込む場合は outv に subtitles フィルタを接続
+                    let mut map_video = "[outv]".to_string();
+                    let mut tmp_ass_path: Option<std::path::PathBuf> = None;
+                    if burn_subtitles {
+                        let items = parse_srt_to_items(&subtitles_srt);
+                        if !items.is_empty() {
+                            let (w, h) = playlist
+                                .get(0)
+                                .map(|c| c.size)
+                                .unwrap_or((1280, 720));
+
+                            let mut ass = String::new();
+                            ass.push_str("[Script Info]\n");
+                            ass.push_str("ScriptType: v4.00+\n");
+                            ass.push_str(&format!("PlayResX: {}\n", w.max(1)));
+                            ass.push_str(&format!("PlayResY: {}\n", h.max(1)));
+                            ass.push_str("ScaledBorderAndShadow: yes\n");
+                            ass.push_str("\n[V4+ Styles]\n");
+                            ass.push_str("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n");
+                            ass.push_str("Style: Default,keifont,48,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,40,1\n");
+                            ass.push_str("\n[Events]\n");
+                            ass.push_str("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n");
+                            for it in items {
+                                let start = ass_time_from_ms(it.start_ms);
+                                let end = ass_time_from_ms(it.end_ms);
+                                let text = escape_ass_text(&it.text);
+                                ass.push_str(&format!(
+                                    "Dialogue: 0,{},{},Default,,0,0,0,,{}\n",
+                                    start, end, text
+                                ));
+                            }
+
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_else(|_| Duration::from_secs(0))
+                                .as_millis();
+                            let ass_path = std::env::temp_dir().join(format!("videoEditer_subs_{}.ass", now));
+                            if fs::write(&ass_path, ass).is_ok() {
+                                let fonts_dir = std::env::current_dir()
+                                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                                    .join("fonts");
+
+                                let ass_esc = escape_ffmpeg_filter_path(&ass_path);
+                                let fonts_esc = escape_ffmpeg_filter_path(&fonts_dir);
+                                filter.push_str(&format!(
+                                    ";[outv]subtitles='{}':fontsdir='{}'[vsub]",
+                                    ass_esc, fonts_esc
+                                ));
+                                map_video = "[vsub]".to_string();
+                                tmp_ass_path = Some(ass_path);
+                            } else {
+                                let _ = tx.send("字幕ファイル生成に失敗（字幕なしで書き出します）".to_string());
+                            }
+                        } else {
+                            let _ = tx.send("字幕が空 or 解析できません（字幕なしで書き出します）".to_string());
+                        }
+                    }
+
                     args.push("-filter_complex".to_string());
                     args.push(filter);
                     args.push("-map".to_string());
-                    args.push("[outv]".to_string());
+                    args.push(map_video);
                     if include_audio {
                         args.push("-map".to_string());
                         args.push("[outa]".to_string());
@@ -662,6 +915,11 @@ impl VideoEditorApp {
                         Err(e) => {
                             let _ = tx.send(format!("ffmpeg起動失敗: {}", e));
                         }
+                    }
+
+                    // 一時字幕ファイルを掃除
+                    if let Some(p) = tmp_ass_path {
+                        let _ = fs::remove_file(p);
                     }
                 });
             }
