@@ -1,6 +1,5 @@
 use eframe::{App, egui};
 use ffmpeg_next as ffmpeg;
-use image::RgbImage;
 use std::default::Default;
 use std::fs;
 use std::process::Command;
@@ -197,7 +196,6 @@ struct VideoClip {
 // プレイリスト用のエントリ（フレームを保持）
 #[derive(Clone)]
 struct ClipEntry {
-    id: usize,
     path: String,
     size: (u32, u32),
     fps: f32,
@@ -320,8 +318,6 @@ struct VideoEditorApp {
     total_frames: usize,
     global_frame: usize, // 再生位置（全体のフレームインデックス）
     current_clip_idx: usize,
-    // タイムライン用サムネイルキャッシュ (frame_index, texture)
-    timeline_thumbs: Vec<(usize, egui::TextureHandle)>,
     // サムネイル再生成フラグ
     timeline_dirty: bool,
     // 切り取り用の秒数指定
@@ -334,10 +330,8 @@ struct VideoEditorApp {
     export_rx: Option<Receiver<String>>,
     // 動画読み込みステータスと受信チャネル
     load_status: Option<String>,
-    load_rx: Option<Receiver<String>>,
     // 音声関連設定
     include_audio: bool,        // エクスポート時に元動画の音声トラックを含める
-    audio_offset_frames: usize, // frames[0] が元動画の何フレーム目に相当するか（音声同期用オフセット）
 
     // 字幕（焼き込み用）
     burn_subtitles: bool,
@@ -357,7 +351,6 @@ impl Default for VideoEditorApp {
             total_frames: 0,
             global_frame: 0,
             current_clip_idx: 0,
-            timeline_thumbs: Vec::new(),
             timeline_dirty: false,
             cut_start_sec: 0.0,
             cut_end_sec: 0.0,
@@ -365,9 +358,7 @@ impl Default for VideoEditorApp {
             export_status: None,
             export_rx: None,
             load_status: None,
-            load_rx: None,
             include_audio: true,
-            audio_offset_frames: 0,
 
             burn_subtitles: false,
             subtitles_srt: "".to_string(),
@@ -414,11 +405,6 @@ impl VideoEditorApp {
             .and_then(|(ci, _)| self.playlist.get(ci))
     }
 
-    fn current_clip_mut(&mut self) -> Option<&mut ClipEntry> {
-        let idx = self.map_global(self.global_frame).map(|(ci, _)| ci)?;
-        self.playlist.get_mut(idx)
-    }
-
     // 指定クリップの先頭にシーク
     fn seek_clip_start(&mut self, clip_idx: usize) {
         if clip_idx < self.playlist.len() {
@@ -452,7 +438,7 @@ impl VideoEditorApp {
         ui.vertical(|ui| {
             let (rect, _res) = ui.allocate_exact_size(view_size, egui::Sense::hover());
             ui.painter()
-                .rect_filled(rect, 0.0, egui::Color32::from_rgb(240, 200, 200));
+                .rect_filled(rect, 0.0, egui::Color32::from_rgb(30, 30, 35));
 
             // プレビュー領域を上下に分割（ラベル + 動画）
             let label_height = 25.0;
@@ -516,7 +502,7 @@ impl VideoEditorApp {
             // タイムライン: クリップの長さに比例したバーを描画し、クリックでシーク
             let (rect, _res) = ui.allocate_exact_size(timeline_size, egui::Sense::hover());
             ui.painter()
-                .rect_filled(rect, 0.0, egui::Color32::from_rgb(200, 240, 200));
+                .rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 30, 35));
 
             let mut timeline_child_ui = ui.child_ui(
                 rect,
@@ -560,7 +546,7 @@ impl VideoEditorApp {
                                     [egui::pos2(x, top), egui::pos2(x, bottom)],
                                     egui::Stroke {
                                         width: 2.0,
-                                        color: egui::Color32::BLACK,
+                                        color: egui::Color32::WHITE,
                                     },
                                 );
                             }
@@ -583,7 +569,7 @@ impl VideoEditorApp {
                             egui::Align2::CENTER_CENTER,
                             label,
                             egui::FontId::proportional(12.0),
-                            egui::Color32::BLACK,
+                            egui::Color32::WHITE,
                         );
                     }
                     if let Some(g) = clicked_global {
@@ -600,7 +586,7 @@ impl VideoEditorApp {
         // 右カラムの描画
         let (rect, _res) = ui.allocate_exact_size(option_size, egui::Sense::hover());
         ui.painter()
-            .rect_filled(rect, 0.0, egui::Color32::from_rgb(200, 200, 240));
+            .rect_filled(rect, 0.0, egui::Color32::from_rgb(35, 35, 40));
 
         let mut option_child_ui = ui.child_ui(
             rect,
@@ -621,7 +607,6 @@ impl VideoEditorApp {
                             (100 + (self.playlist.len() * 60 % 155)) as u8,
                         );
                         let entry = ClipEntry {
-                            id: self.playlist.len(),
                             path: clip.video_path_input.clone(),
                             size: clip.size,
                             fps: clip.fps,
@@ -1090,5 +1075,9 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     let app = VideoEditorApp::default();
-    eframe::run_native("RustVideoEditor", options, Box::new(|_cc| Box::new(app)))
+    eframe::run_native("FerrisEdit", options, Box::new(|cc| {
+        // ダークテーマを適用
+        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        Box::new(app)
+    }))
 }
