@@ -21,9 +21,9 @@ fn parse_srt_to_items(srt: &str) -> Vec<SubtitleItem> {
     let mut current_text_lines: Vec<String> = Vec::new();
 
     let flush = |items: &mut Vec<SubtitleItem>,
-                     current_start: &mut Option<u64>,
-                     current_end: &mut Option<u64>,
-                     current_text_lines: &mut Vec<String>| {
+                 current_start: &mut Option<u64>,
+                 current_end: &mut Option<u64>,
+                 current_text_lines: &mut Vec<String>| {
         if let (Some(start), Some(end)) = (*current_start, *current_end) {
             let text = current_text_lines.join("\n").trim().to_string();
             if !text.is_empty() && end > start {
@@ -53,7 +53,8 @@ fn parse_srt_to_items(srt: &str) -> Vec<SubtitleItem> {
         }
 
         // SRT index line (e.g., "1")
-        if current_start.is_none() && current_end.is_none() && t.chars().all(|c| c.is_ascii_digit()) {
+        if current_start.is_none() && current_end.is_none() && t.chars().all(|c| c.is_ascii_digit())
+        {
             continue;
         }
 
@@ -71,7 +72,9 @@ fn parse_srt_to_items(srt: &str) -> Vec<SubtitleItem> {
             let mut parts = t.split("-->");
             let start_str = parts.next().unwrap_or("").trim();
             let end_str = parts.next().unwrap_or("").trim();
-            if let (Some(start), Some(end)) = (parse_srt_time_ms(start_str), parse_srt_time_ms(end_str)) {
+            if let (Some(start), Some(end)) =
+                (parse_srt_time_ms(start_str), parse_srt_time_ms(end_str))
+            {
                 current_start = Some(start);
                 current_end = Some(end);
             }
@@ -179,6 +182,47 @@ fn escape_ffmpeg_filter_path(path: &std::path::Path) -> String {
     s = s.replace('"', "\\\"");
     s = s.replace('\'', "\\\'");
     s
+}
+
+fn format_srt_time_ms(ms: u64) -> String {
+    let total_seconds = ms / 1000;
+    let milli = ms % 1000;
+    let s = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let m = total_minutes % 60;
+    let h = total_minutes / 60;
+    format!("{:02}:{:02}:{:02},{:03}", h, m, s, milli)
+}
+
+fn generate_simple_srt_from_lines(
+    lines: &str,
+    start_offset_sec: f32,
+    line_duration_sec: f32,
+    gap_sec: f32,
+) -> String {
+    let duration = line_duration_sec.max(0.1);
+    let gap = gap_sec.max(0.0);
+    let start_offset = start_offset_sec.max(0.0);
+    let mut out = String::new();
+    let mut idx: u32 = 1;
+    for line in lines.lines() {
+        let text = line.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let start_sec = start_offset + (idx as f32 - 1.0) * (duration + gap);
+        let end_sec = start_sec + duration;
+        let start_ms = (start_sec * 1000.0).round().max(0.0) as u64;
+        let end_ms = (end_sec * 1000.0).round().max(0.0) as u64;
+        let start_str = format_srt_time_ms(start_ms);
+        let end_str = format_srt_time_ms(end_ms);
+        out.push_str(&format!(
+            "{}\n{} --> {}\n{}\n\n",
+            idx, start_str, end_str, text
+        ));
+        idx += 1;
+    }
+    out
 }
 
 // アップロード時に大きすぎるフレームを縮小するための最大幅・高さ
@@ -331,11 +375,17 @@ struct VideoEditorApp {
     // 動画読み込みステータスと受信チャネル
     load_status: Option<String>,
     // 音声関連設定
-    include_audio: bool,        // エクスポート時に元動画の音声トラックを含める
+    include_audio: bool, // エクスポート時に元動画の音声トラックを含める
 
     // 字幕（焼き込み用）
     burn_subtitles: bool,
     subtitles_srt: String,
+    simple_subtitle_mode: bool,
+    simple_subtitle_text: String,
+    simple_subtitle_start_sec: f32,
+    simple_subtitle_line_duration_sec: f32,
+    simple_subtitle_gap_sec: f32,
+    simple_subtitle_size: f32,
 }
 
 impl Default for VideoEditorApp {
@@ -362,6 +412,12 @@ impl Default for VideoEditorApp {
 
             burn_subtitles: false,
             subtitles_srt: "".to_string(),
+            simple_subtitle_mode: false,
+            simple_subtitle_text: "".to_string(),
+            simple_subtitle_start_sec: 0.5,
+            simple_subtitle_line_duration_sec: 2.5,
+            simple_subtitle_gap_sec: 0.3,
+            simple_subtitle_size: 100.0,
         }
     }
 }
@@ -746,12 +802,60 @@ impl VideoEditorApp {
                 ui.checkbox(&mut self.burn_subtitles, "字幕を焼き込む");
             });
             if self.burn_subtitles {
-                ui.label("字幕（SRT形式）を貼り付け:");
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.subtitles_srt)
-                        .desired_rows(8)
-                        .hint_text("例:\n1\n00:00:01,000 --> 00:00:03,000\nこんにちは\n\n2\n00:00:04,000 --> 00:00:06,000\n字幕だよ"),
+                ui.checkbox(
+                    &mut self.simple_subtitle_mode,
+                    "SRT不要の簡易入力（1行=1字幕）",
                 );
+
+                if self.simple_subtitle_mode {
+                    ui.label("一行ごとに字幕として表示します。");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.simple_subtitle_text)
+                            .desired_rows(8)
+                            .hint_text("例:\nこんにちは\n字幕だよ\n3行目\n4行目"),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("開始オフセット(s):");
+                        ui.add(
+                            egui::widgets::DragValue::new(&mut self.simple_subtitle_start_sec)
+                                .speed(0.1)
+                                .clamp_range(0.0..=600.0),
+                        );
+                        ui.label("1行の表示秒数:");
+                        ui.add(
+                            egui::widgets::DragValue::new(
+                                &mut self.simple_subtitle_line_duration_sec,
+                            )
+                            .speed(0.1)
+                            .clamp_range(0.1..=30.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("行間の空き(s):");
+                        ui.add(
+                            egui::widgets::DragValue::new(&mut self.simple_subtitle_gap_sec)
+                                .speed(0.1)
+                                .clamp_range(0.0..=30.0),
+                        );
+                    });
+                    
+                } else {
+                    ui.label("字幕（SRT形式）を貼り付け:");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.subtitles_srt)
+                            .desired_rows(8)
+                            .hint_text("例:\n1\n00:00:01,000 --> 00:00:03,000\nこんにちは\n\n2\n00:00:04,000 --> 00:00:06,000\n字幕だよ"),
+                    );
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label("字幕フォントサイズ:");
+                    ui.add(
+                        egui::widgets::DragValue::new(&mut self.simple_subtitle_size)
+                            .speed(1.0)
+                            .clamp_range(8.0..=200.0),
+                    );
+                });
             }
 
             if ui.button("書き出し").clicked() {
@@ -764,6 +868,13 @@ impl VideoEditorApp {
                 let playlist = self.playlist.clone();
                 let burn_subtitles = self.burn_subtitles;
                 let subtitles_srt = self.subtitles_srt.clone();
+                let simple_subtitle_mode = self.simple_subtitle_mode;
+                let simple_subtitle_text = self.simple_subtitle_text.clone();
+                let simple_subtitle_start_sec = self.simple_subtitle_start_sec;
+                let simple_subtitle_line_duration_sec =
+                    self.simple_subtitle_line_duration_sec;
+                let simple_subtitle_gap_sec = self.simple_subtitle_gap_sec;
+                let simple_subtitle_size = self.simple_subtitle_size;
 
                 thread::spawn(move || {
                     if playlist.is_empty() {
@@ -808,6 +919,17 @@ impl VideoEditorApp {
                     let mut map_video = "[outv]".to_string();
                     let mut tmp_ass_path: Option<std::path::PathBuf> = None;
                     if burn_subtitles {
+                        let subtitles_srt = if simple_subtitle_mode {
+                            generate_simple_srt_from_lines(
+                                &simple_subtitle_text,
+                                simple_subtitle_start_sec,
+                                simple_subtitle_line_duration_sec,
+                                simple_subtitle_gap_sec,
+                            )
+                        } else {
+                            subtitles_srt
+                        };
+
                         let items = parse_srt_to_items(&subtitles_srt);
                         if !items.is_empty() {
                             let (w, h) = playlist
@@ -823,7 +945,10 @@ impl VideoEditorApp {
                             ass.push_str("ScaledBorderAndShadow: yes\n");
                             ass.push_str("\n[V4+ Styles]\n");
                             ass.push_str("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n");
-                            ass.push_str("Style: Default,keifont,48,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,40,1\n");
+                            ass.push_str(&format!(
+                                "Style: Default,keifont,{:.1},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,40,1\n",
+                                simple_subtitle_size
+                            ));
                             ass.push_str("\n[Events]\n");
                             ass.push_str("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n");
                             for it in items {
@@ -1075,9 +1200,13 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     let app = VideoEditorApp::default();
-    eframe::run_native("FerrisEdit", options, Box::new(|cc| {
-        // ダークテーマを適用
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        Box::new(app)
-    }))
+    eframe::run_native(
+        "FerrisEdit",
+        options,
+        Box::new(|cc| {
+            // ダークテーマを適用
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            Box::new(app)
+        }),
+    )
 }
