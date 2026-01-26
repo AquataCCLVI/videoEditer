@@ -14,6 +14,7 @@ struct SubtitleItem {
     text: String,
 }
 
+// 文字列をパースしてSubtitleItemのベクターを作成
 fn parse_srt_to_items(srt: &str) -> Vec<SubtitleItem> {
     let mut items = Vec::<SubtitleItem>::new();
     let mut current_start: Option<u64> = None;
@@ -52,13 +53,13 @@ fn parse_srt_to_items(srt: &str) -> Vec<SubtitleItem> {
             continue;
         }
 
-        // SRT index line (e.g., "1")
+        // SRTのインデックス行は無視
         if current_start.is_none() && current_end.is_none() && t.chars().all(|c| c.is_ascii_digit())
         {
             continue;
         }
 
-        // timecode line
+        // timecode行の解析
         if t.contains("-->") {
             // start/end already set? flush and start new.
             if current_start.is_some() || current_end.is_some() || !current_text_lines.is_empty() {
@@ -81,13 +82,13 @@ fn parse_srt_to_items(srt: &str) -> Vec<SubtitleItem> {
             continue;
         }
 
-        // text line
+        // textを収集
         if current_start.is_some() && current_end.is_some() {
             current_text_lines.push(t.to_string());
         }
     }
 
-    // flush last
+    // flushで残りを処理
     flush(
         &mut items,
         &mut current_start,
@@ -98,6 +99,7 @@ fn parse_srt_to_items(srt: &str) -> Vec<SubtitleItem> {
     items
 }
 
+// SRTの時間表記をミリ秒に変換
 fn parse_srt_time_ms(s: &str) -> Option<u64> {
     // Accept: HH:MM:SS,mmm or HH:MM:SS.mmm
     // Also accept: MM:SS,mmm or MM:SS.mmm
@@ -149,6 +151,7 @@ fn parse_srt_time_ms(s: &str) -> Option<u64> {
     Some(((h * 3600 + m * 60 + sec) * 1000) + ms)
 }
 
+// ミリ秒をASS時間表記に変換
 fn ass_time_from_ms(ms: u64) -> String {
     // ASS uses h:mm:ss.cc (centiseconds)
     let total_cs = ms / 10;
@@ -161,6 +164,7 @@ fn ass_time_from_ms(ms: u64) -> String {
     format!("{}:{:02}:{:02}.{:02}", h, m, s, cs)
 }
 
+// ASSテキスト用に特殊文字をエスケープ
 fn escape_ass_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -174,6 +178,7 @@ fn escape_ass_text(text: &str) -> String {
     out
 }
 
+// ffmpegのフィルターグラフ用にパスをエスケープ
 fn escape_ffmpeg_filter_path(path: &std::path::Path) -> String {
     // ffmpeg filter graph parsing is picky on Windows (drive letter ':' etc)
     // Use forward slashes and escape ':' and '\''.
@@ -184,6 +189,7 @@ fn escape_ffmpeg_filter_path(path: &std::path::Path) -> String {
     s
 }
 
+// ミリ秒をSRT時間表記に変換
 fn format_srt_time_ms(ms: u64) -> String {
     let total_seconds = ms / 1000;
     let milli = ms % 1000;
@@ -194,6 +200,7 @@ fn format_srt_time_ms(ms: u64) -> String {
     format!("{:02}:{:02}:{:02},{:03}", h, m, s, milli)
 }
 
+// シンプルなテキスト行からSRTを生成(簡易版の処理)
 fn generate_simple_srt_from_lines(
     lines: &str,
     start_offset_sec: f32,
@@ -247,6 +254,7 @@ struct ClipEntry {
     color: egui::Color32,
 }
 
+// 動画クリップを読み込む
 impl VideoClip {
     fn load(path: &str) -> std::result::Result<VideoClip, ffmpeg::Error> {
         ffmpeg::format::input(&path).and_then(|mut ictx| {
@@ -351,6 +359,7 @@ impl VideoClip {
     }
 }
 
+// アプリ本体
 struct VideoEditorApp {
     video_path_input: String,
     texture: Option<egui::TextureHandle>, // 動画表示用テクスチャ
@@ -671,6 +680,7 @@ impl VideoEditorApp {
                         };
                         self.playlist.push(entry);
                         self.rebuild_offsets();
+                        // saturating_sub で負にならないように調整
                         self.global_frame = self.total_frames.saturating_sub(1);
                         self.current_clip_idx = self.playlist.len().saturating_sub(1);
                         self.timeline_dirty = true;
@@ -725,7 +735,7 @@ impl VideoEditorApp {
                                 }
                                 if end_f <= 0 {
                                     end_f = total_frames as isize;
-                                }
+                                } 
                                 let mut s = start_f as usize;
                                 let mut e = end_f as usize;
                                 if s > total_frames {
@@ -759,9 +769,9 @@ impl VideoEditorApp {
                                 if start_f < 0 {
                                     start_f = 0;
                                 }
-                                if end_f < 0 {
-                                    end_f = 0;
-                                }
+                                if end_f <= 0 {
+                                    end_f = total_frames as isize;
+                                } 
                                 let mut s = start_f as usize;
                                 let mut e = end_f as usize;
                                 if s > total_frames {
@@ -937,6 +947,7 @@ impl VideoEditorApp {
                                 .map(|c| c.size)
                                 .unwrap_or((1280, 720));
 
+                            // srtをass方式に変換
                             let mut ass = String::new();
                             ass.push_str("[Script Info]\n");
                             ass.push_str("ScriptType: v4.00+\n");
