@@ -252,6 +252,118 @@ struct ClipEntry {
     fps: f32,
     frames: Vec<Vec<u8>>,
     color: egui::Color32,
+
+    /// 元動画（読み込み時のフレーム列）上で残す区間（start,end）※endはexclusive
+    /// UI上の編集（framesの削除/抽出）に追従して更新する
+    segments: Vec<(usize, usize)>,
+}
+
+impl ClipEntry {
+    fn normalize_segments(segs: &mut Vec<(usize, usize)>) {
+        segs.retain(|(s, e)| e > s);
+        segs.sort_by_key(|(s, _)| *s);
+        // 隣接/重複をマージ
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (s, e) in segs.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                if s <= last.1 {
+                    last.1 = last.1.max(e);
+                    continue;
+                }
+                if s == last.1 {
+                    last.1 = e;
+                    continue;
+                }
+            }
+            merged.push((s, e));
+        }
+        *segs = merged;
+    }
+
+    fn segments_total_len(&self) -> usize {
+        self.segments.iter().map(|(s, e)| e.saturating_sub(*s)).sum()
+    }
+
+    /// 現在のクリップ（segmentsを順に連結したローカルタイムライン）から [del_start, del_end) を削除
+    fn apply_delete_local_range(&mut self, del_start: usize, del_end: usize) {
+        if del_start >= del_end || self.segments.is_empty() {
+            return;
+        }
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let mut local_off = 0usize;
+
+        for (orig_s, orig_e) in self.segments.iter().copied() {
+            let seg_len = orig_e.saturating_sub(orig_s);
+            if seg_len == 0 {
+                continue;
+            }
+            let seg_local_s = local_off;
+            let seg_local_e = local_off.saturating_add(seg_len);
+
+            // overlap in local
+            let ov_s = del_start.max(seg_local_s);
+            let ov_e = del_end.min(seg_local_e);
+
+            if ov_s >= ov_e {
+                // no overlap -> keep whole
+                out.push((orig_s, orig_e));
+            } else {
+                // keep left part
+                if ov_s > seg_local_s {
+                    let keep_local_s = seg_local_s;
+                    let keep_local_e = ov_s;
+                    let keep_orig_s = orig_s + (keep_local_s - seg_local_s);
+                    let keep_orig_e = orig_s + (keep_local_e - seg_local_s);
+                    out.push((keep_orig_s, keep_orig_e));
+                }
+                // keep right part
+                if ov_e < seg_local_e {
+                    let keep_local_s = ov_e;
+                    let keep_local_e = seg_local_e;
+                    let keep_orig_s = orig_s + (keep_local_s - seg_local_s);
+                    let keep_orig_e = orig_s + (keep_local_e - seg_local_s);
+                    out.push((keep_orig_s, keep_orig_e));
+                }
+            }
+
+            local_off = seg_local_e;
+        }
+
+        Self::normalize_segments(&mut out);
+        self.segments = out;
+    }
+
+    /// 現在のクリップ（ローカル）で [keep_start, keep_end) のみ残す（それ以外は捨てる）
+    fn apply_extract_local_range(&mut self, keep_start: usize, keep_end: usize) {
+        if keep_start >= keep_end || self.segments.is_empty() {
+            self.segments.clear();
+            return;
+        }
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let mut local_off = 0usize;
+
+        for (orig_s, orig_e) in self.segments.iter().copied() {
+            let seg_len = orig_e.saturating_sub(orig_s);
+            if seg_len == 0 {
+                continue;
+            }
+            let seg_local_s = local_off;
+            let seg_local_e = local_off.saturating_add(seg_len);
+
+            let is_s = keep_start.max(seg_local_s);
+            let is_e = keep_end.min(seg_local_e);
+            if is_s < is_e {
+                let keep_orig_s = orig_s + (is_s - seg_local_s);
+                let keep_orig_e = orig_s + (is_e - seg_local_s);
+                out.push((keep_orig_s, keep_orig_e));
+            }
+
+            local_off = seg_local_e;
+        }
+
+        Self::normalize_segments(&mut out);
+        self.segments = out;
+    }
 }
 
 // 動画クリップを読み込む
@@ -581,7 +693,7 @@ impl VideoEditorApp {
                     let current = self.map_global(self.global_frame);
                     for (idx, clip) in self.playlist.iter().enumerate() {
                         let start = self.clip_offsets[idx] as f32;
-                        let end = start + clip.frames.len() as f32;
+                        let _end = start + clip.frames.len() as f32;
                         let ratio = clip.frames.len() as f32 / self.total_frames as f32;
                         let width = (total_w * ratio).max(8.0);
                         let height = 40.0;
@@ -671,12 +783,14 @@ impl VideoEditorApp {
                             (80 + (self.playlist.len() * 90 % 150)) as u8,
                             (100 + (self.playlist.len() * 60 % 155)) as u8,
                         );
+                        let frames_len = clip.frames.len();
                         let entry = ClipEntry {
                             path: clip.video_path_input.clone(),
                             size: clip.size,
                             fps: clip.fps,
                             frames: clip.frames,
                             color,
+                            segments: vec![(0, frames_len)],
                         };
                         self.playlist.push(entry);
                         self.rebuild_offsets();
@@ -722,7 +836,7 @@ impl VideoEditorApp {
                 ui.add(egui::widgets::DragValue::new(&mut self.cut_end_sec).speed(0.1));
             });
 
-            ui.horizontal(|ui| {
+            
                 if ui.button("指定範囲を切り取る").clicked() {
                     if let Some((ci, _)) = self.map_global(self.global_frame) {
                         if let Some(clip) = self.playlist.get_mut(ci) {
@@ -749,7 +863,10 @@ impl VideoEditorApp {
                                 }
 
                                 if s < e {
+                                    // export用の保持区間も同じローカル範囲で削除
+                                    clip.apply_delete_local_range(s, e);
                                     clip.frames.drain(s..e);
+
                                     self.rebuild_offsets();
                                     self.seek_clip_start(ci);
                                     self.timeline_dirty = true;
@@ -785,8 +902,10 @@ impl VideoEditorApp {
                                 }
 
                                 if s < e {
-                                    let new_frames: Vec<Vec<u8>> = clip.frames[s..e].to_vec();
-                                    clip.frames = new_frames;
+                                    // export用の保持区間も同じローカル範囲で抽出
+                                    clip.apply_extract_local_range(s, e);
+                                    clip.frames = clip.frames[s..e].to_vec();
+
                                     self.rebuild_offsets();
                                     self.seek_clip_start(ci);
                                     self.timeline_dirty = true;
@@ -795,7 +914,7 @@ impl VideoEditorApp {
                         }
                     }
                 }
-            });
+           
 
             ui.separator();
             ui.horizontal(|ui| {
@@ -892,6 +1011,13 @@ impl VideoEditorApp {
                         return;
                     }
 
+                    // segmentsベースで「実際に出すフレーム」が0なら中断
+                    let any_frames = playlist.iter().any(|c| c.segments_total_len() > 0);
+                    if !any_frames {
+                        let _ = tx.send("出力するフレームがありません（全て削除されています）".to_string());
+                        return;
+                    }
+
                     let out_path_abs = if std::path::Path::new(&out).is_absolute() {
                         std::path::PathBuf::from(&out)
                     } else {
@@ -903,29 +1029,75 @@ impl VideoEditorApp {
                     let mut args: Vec<String> = Vec::new();
                     args.push("-y".to_string());
 
-                    // クリップをそれぞれ入力として渡す
+                    // 入力（元ファイル）は従来通り
                     for clip in &playlist {
                         args.push("-i".to_string());
                         args.push(clip.path.clone());
                     }
 
-                    // filter_complex を構築
                     let n = playlist.len();
                     let mut filter = String::new();
+
+                    // 1) 各入力クリップを segments で trim/atrim し、クリップ内で concat => [v{i}] [a{i}]
                     for i in 0..n {
-                        filter.push_str(&format!("[{}:v][{}:a]", i, i));
-                    }
-                    if include_audio {
-                        filter.push_str(&format!("concat=n={}:v=1:a=1[outv][outa]", n));
-                    } else {
-                        // 音声なし
-                        for i in 0..n {
-                            filter.push_str(&format!("[{}:v]", i));
+                        let clip = &playlist[i];
+                        let fps = clip.fps.max(1.0);
+                        let segs = clip.segments.clone();
+                        let seg_count = segs.len();
+
+                        if seg_count == 0 {
+                            // 全削除クリップは無視できないので、ここで落とす（上でany_frames見てるが念のため）
+                            let _ = tx.send(format!("クリップ{}が空です: {}", i + 1, clip.path));
+                            return;
                         }
-                        filter.push_str(&format!("concat=n={}:v=1:a=0[outv]", n));
+
+                        for (j, (fs, fe)) in segs.iter().copied().enumerate() {
+                            let ss = (fs as f64) / (fps as f64);
+                            let ee = (fe as f64) / (fps as f64);
+                            // video
+                            filter.push_str(&format!(
+                                "[{i}:v]trim=start={ss}:end={ee},setpts=PTS-STARTPTS[v{i}_{j}];"
+                            ));
+                            // audio（必要な時だけ）
+                            if include_audio {
+                                filter.push_str(&format!(
+                                    "[{i}:a]atrim=start={ss}:end={ee},asetpts=PTS-STARTPTS[a{i}_{j}];"
+                                ));
+                            }
+                        }
+
+                        // clip内concat
+                        if include_audio {
+                            for j in 0..seg_count {
+                                filter.push_str(&format!("[v{i}_{j}][a{i}_{j}]"));
+                            }
+                            filter.push_str(&format!(
+                                "concat=n={seg_count}:v=1:a=1[v{i}][a{i}];"
+                            ));
+                        } else {
+                            for j in 0..seg_count {
+                                filter.push_str(&format!("[v{i}_{j}]"));
+                            }
+                            filter.push_str(&format!(
+                                "concat=n={seg_count}:v=1:a=0[v{i}];"
+                            ));
+                        }
                     }
 
-                    // 字幕を焼き込む場合は outv に subtitles フィルタを接続
+                    // 2) 全クリップconcat => [outv][outa]
+                    if include_audio {
+                        for i in 0..n {
+                            filter.push_str(&format!("[v{i}][a{i}]"));
+                        }
+                        filter.push_str(&format!("concat=n={n}:v=1:a=1[outv][outa]"));
+                    } else {
+                        for i in 0..n {
+                            filter.push_str(&format!("[v{i}]"));
+                        }
+                        filter.push_str(&format!("concat=n={n}:v=1:a=0[outv]"));
+                    }
+
+                    // 3) 字幕焼き込み（従来通り、最終outvに接続）
                     let mut map_video = "[outv]".to_string();
                     let mut tmp_ass_path: Option<std::path::PathBuf> = None;
                     if burn_subtitles {
@@ -947,7 +1119,6 @@ impl VideoEditorApp {
                                 .map(|c| c.size)
                                 .unwrap_or((1280, 720));
 
-                            // srtをass方式に変換
                             let mut ass = String::new();
                             ass.push_str("[Script Info]\n");
                             ass.push_str("ScriptType: v4.00+\n");
@@ -1014,7 +1185,7 @@ impl VideoEditorApp {
                     }
                     args.push(out_path_abs.to_string_lossy().to_string());
 
-                    let _ = tx.send("ffmpeg concat で書き出し中...".to_string());
+                    let _ = tx.send("ffmpeg（trim+concat）で書き出し中...".to_string());
 
                     let output = Command::new("ffmpeg")
                         .args(&args)
@@ -1038,7 +1209,6 @@ impl VideoEditorApp {
                         }
                     }
 
-                    // 一時字幕ファイルを掃除
                     if let Some(p) = tmp_ass_path {
                         let _ = fs::remove_file(p);
                     }
@@ -1075,7 +1245,17 @@ impl App for VideoEditorApp {
             .insert(0, "keifont".to_owned());
         ctx.set_fonts(fonts);
 
-        // 読み込み進捗のポーリング（現在は同期ロードのため未使用）
+        // フォントサイズを設定
+        ctx.style_mut(|style| {
+            style.text_styles = [
+            (egui::TextStyle::Small, egui::FontId::new(12.0, Proportional)),
+            (egui::TextStyle::Body, egui::FontId::new(16.0, Proportional)),
+            (egui::TextStyle::Button, egui::FontId::new(16.0, Proportional)),
+            (egui::TextStyle::Heading, egui::FontId::new(20.0, Proportional)),
+            (egui::TextStyle::Monospace, egui::FontId::new(14.0, egui::FontFamily::Monospace)),
+            ].into();
+        });
+
 
         // export スレッドからのメッセージをここで受け取り、受信があれば再描画要求を出す
         if let Some(rx) = &self.export_rx {
@@ -1087,10 +1267,10 @@ impl App for VideoEditorApp {
                         self.export_status = Some(msg.clone());
                         any = true;
                         if let Some(s) = &self.export_status {
-                            if s.starts_with("Export succeeded")
-                                || s.starts_with("No frames to export")
+                            if s.starts_with("出力成功")
+                                || s.starts_with("出力失敗")
+                                || s.starts_with("ffmpeg起動失敗")
                             {
-                                // 完了メッセージが来たらチャネルを外す
                                 self.export_rx = None;
                                 break;
                             }
@@ -1181,7 +1361,6 @@ impl App for VideoEditorApp {
 
         //メイン画面構成
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
             //画面サイズを指定→eguiで使える形式に変換
             let view_size = [860.0, 400.0];
             let view_size = egui::vec2(view_size[0], view_size[1]);
@@ -1193,6 +1372,7 @@ impl App for VideoEditorApp {
             let option_size = egui::vec2(option_size[0], option_size[1]);
 
             ui.horizontal(|ui| {
+                
                 //右左のカラムを関数で分ける
                 self.draw_left_column(ui, view_size, timeline_size);
 
