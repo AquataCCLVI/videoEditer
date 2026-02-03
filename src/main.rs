@@ -200,6 +200,17 @@ fn format_srt_time_ms(ms: u64) -> String {
     format!("{:02}:{:02}:{:02},{:03}", h, m, s, milli)
 }
 
+// UI表示向けの時間表記 (HH:MM:SS.mmm)
+fn format_clock_time_ms(ms: u64) -> String {
+    let total_seconds = ms / 1000;
+    let milli = ms % 1000;
+    let s = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let m = total_minutes % 60;
+    let h = total_minutes / 60;
+    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, milli)
+}
+
 // シンプルなテキスト行からSRTを生成(簡易版の処理)
 fn generate_simple_srt_from_lines(
     lines: &str,
@@ -544,6 +555,45 @@ impl Default for VideoEditorApp {
 }
 
 impl VideoEditorApp {
+    fn timeline_total_duration_ms(&self) -> u64 {
+        let mut seconds = 0.0f64;
+        for clip in &self.playlist {
+            if clip.fps > 0.0 {
+                seconds += clip.frames.len() as f64 / clip.fps as f64;
+            }
+        }
+        (seconds * 1000.0).round().max(0.0) as u64
+    }
+
+    fn timeline_global_time_ms(&self, g: usize) -> u64 {
+        if self.playlist.is_empty() {
+            return 0;
+        }
+
+        // clip_offsets が未生成/不整合な場合は安全側で 0 を返す
+        if self.clip_offsets.len() != self.playlist.len() {
+            return 0;
+        }
+
+        let mut seconds = 0.0f64;
+        for (idx, clip) in self.playlist.iter().enumerate() {
+            if clip.fps <= 0.0 {
+                continue;
+            }
+            let start = self.clip_offsets[idx];
+            let end = start.saturating_add(clip.frames.len());
+            if g >= end {
+                seconds += clip.frames.len() as f64 / clip.fps as f64;
+            } else {
+                let local = g.saturating_sub(start);
+                seconds += local as f64 / clip.fps as f64;
+                break;
+            }
+        }
+
+        (seconds * 1000.0).round().max(0.0) as u64
+    }
+
     // 累積オフセットを再計算
     fn rebuild_offsets(&mut self) {
         self.clip_offsets.clear();
@@ -681,6 +731,29 @@ impl VideoEditorApp {
             ui.painter()
                 .rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 30, 35));
 
+            // 現在時刻 / フレーム数の表示（タイムライン矩形へのオーバーレイ）
+            if self.total_frames > 0 {
+                let cur_ms = self.timeline_global_time_ms(self.global_frame);
+                let total_ms = self.timeline_total_duration_ms();
+                let frame_now = self.global_frame.saturating_add(1);
+                let frame_total = self.total_frames;
+                let label = format!(
+                    "Time: {} / {}    Frame: {} / {}",
+                    format_clock_time_ms(cur_ms),
+                    format_clock_time_ms(total_ms),
+                    frame_now,
+                    frame_total
+                );
+
+                ui.painter().text(
+                    rect.left_top() + egui::vec2(6.0, 4.0),
+                    egui::Align2::LEFT_TOP,
+                    label,
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_gray(220),
+                );
+            }
+
             let mut timeline_child_ui = ui.child_ui(
                 rect,
                 egui::Layout::centered_and_justified(egui::Direction::TopDown),
@@ -740,7 +813,7 @@ impl VideoEditorApp {
                             clicked_global = Some(g.min(self.total_frames.saturating_sub(1)));
                         }
                         let label =
-                            format!("{}: {:.1}s", idx + 1, clip.frames.len() as f32 / clip.fps);
+                            format!("{} | {:.1}s", idx + 1, clip.frames.len() as f32 / clip.fps);
                         ui.painter().text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
@@ -837,7 +910,7 @@ impl VideoEditorApp {
             });
 
             
-                if ui.button("指定範囲を切り取る").clicked() {
+                if ui.button("指定範囲を消す").clicked() {
                     if let Some((ci, _)) = self.map_global(self.global_frame) {
                         if let Some(clip) = self.playlist.get_mut(ci) {
                             if clip.fps > 0.0 && !clip.frames.is_empty() {
